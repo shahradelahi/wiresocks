@@ -1,19 +1,17 @@
 package socks5
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"strconv"
 	"strings"
-	"sync"
 )
 
 var (
 	errStringTooLong        = errors.New("string too long")
+	errUserAuthFailed       = errors.New("user authentication failed")
 	errNoSupportedAuth      = errors.New("no supported authentication mechanism")
 	errUnrecognizedAddrType = errors.New("unrecognized address type")
 )
@@ -30,6 +28,10 @@ const (
 	ConnectCommand   Command = 0x01
 	BindCommand      Command = 0x02
 	AssociateCommand Command = 0x03
+)
+
+const (
+	defaultBindAddress = "127.0.0.1:1080"
 )
 
 // Command is a SOCKS Command.
@@ -145,6 +147,12 @@ const (
 	noAcceptable         authMethod = 0xff // no acceptable authentication methods
 )
 
+const (
+	userAuthVersion = 0x01
+	authSuccess     = 0x00
+	authFailure     = 0x01
+)
+
 func readBytes(r io.Reader) ([]byte, error) {
 	var buf [1]byte
 	_, err := r.Read(buf[:])
@@ -159,14 +167,14 @@ func readBytes(r io.Reader) ([]byte, error) {
 	return bytes, nil
 }
 
-// func writeBytes(w io.Writer, b []byte) error {
-// 	_, err := w.Write([]byte{byte(len(b))})
-// 	if err != nil {
-// 		return err
-// 	}
-// 	_, err = w.Write(b)
-// 	return err
-// }
+func writeBytes(w io.Writer, b []byte) error {
+	_, err := w.Write([]byte{byte(len(b))})
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(b)
+	return err
+}
 
 func readByte(r io.Reader) (byte, error) {
 	var buf [1]byte
@@ -300,120 +308,4 @@ func splitHostPort(address string) (string, int, error) {
 		return "", 0, errors.New("port number out of range " + port)
 	}
 	return host, portnum, nil
-}
-
-type readStruct struct {
-	data []byte
-	err  error
-}
-
-type udpCustomConn struct {
-	net.PacketConn
-	assocTCPConn net.Conn
-	lock         sync.Mutex
-	sourceAddr   net.Addr
-	targetAddr   net.Addr
-	replyPrefix  []byte
-	firstRead    sync.Once
-	frc          chan bool
-	packetQueue  chan *readStruct
-}
-
-func (cc *udpCustomConn) RemoteAddr() net.Addr {
-	return cc.targetAddr
-}
-
-func (cc *udpCustomConn) asyncReadPackets() {
-	go func() {
-		tempBuf := make([]byte, maxUdpPacket)
-		for {
-			n, addr, err := cc.ReadFrom(tempBuf)
-			if err != nil {
-				cc.packetQueue <- &readStruct{
-					data: nil,
-					err:  err,
-				}
-				break
-			}
-			if n < 3 {
-				cc.packetQueue <- &readStruct{
-					data: nil,
-					err:  err,
-				}
-				break
-			}
-			if cc.sourceAddr == nil {
-				cc.sourceAddr = addr
-			}
-
-			reader := bytes.NewBuffer(tempBuf[3:n])
-			targetAddr, err := readAddr(reader)
-
-			if err != nil {
-				cc.packetQueue <- &readStruct{
-					data: nil,
-					err:  err,
-				}
-				break
-			}
-			if cc.targetAddr == nil {
-				cc.targetAddr = &net.UDPAddr{
-					IP:   targetAddr.IP,
-					Port: targetAddr.Port,
-				}
-			}
-			if targetAddr.String() != cc.targetAddr.String() {
-				cc.packetQueue <- &readStruct{
-					data: nil,
-					err:  fmt.Errorf("ignore non-target addresses %s", targetAddr.String()),
-				}
-				break
-			}
-			cc.firstRead.Do(func() {
-				// ok we have source and destination address now user can handle new ProxyReq
-				cc.frc <- true
-			})
-			cc.packetQueue <- &readStruct{
-				data: reader.Bytes(),
-				err:  nil,
-			}
-		}
-	}()
-}
-
-func (cc *udpCustomConn) Read(b []byte) (int, error) {
-	// wait for packet data
-	read := <-cc.packetQueue
-	if read.err != nil {
-		return 0, read.err
-	}
-	copy(b, read.data)
-	return len(read.data), nil
-}
-
-func (cc *udpCustomConn) Write(b []byte) (int, error) {
-	cc.lock.Lock()
-	defer cc.lock.Unlock()
-	if cc.replyPrefix == nil {
-		prefix := bytes.NewBuffer(make([]byte, 3, 16))
-		err := writeAddrWithStr(prefix, cc.targetAddr.String())
-		if err != nil {
-			return 0, err
-		}
-		cc.replyPrefix = prefix.Bytes()
-	}
-	buff := append(cc.replyPrefix, b...)
-	_, err := cc.WriteTo(buff[:len(cc.replyPrefix)+len(b)], cc.sourceAddr)
-	return len(b), err
-}
-
-func (cc *udpCustomConn) Close() error {
-	cc.lock.Lock()
-	defer cc.lock.Unlock()
-	udpErr := cc.PacketConn.Close()
-	tcpErr := cc.assocTCPConn.Close()
-	if udpErr != nil {
-		return udpErr
-	}
-	return tcpErr
 }

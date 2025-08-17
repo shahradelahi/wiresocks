@@ -212,7 +212,8 @@ func ParsePeers(cfg *ini.File) ([]PeerConfig, error) {
 		if sectionKey, err := section.GetKey("AllowedIPs"); err == nil {
 			var ips []netip.Prefix
 			for _, str := range sectionKey.StringsWithShadows(",") {
-				prefix, err := netip.ParsePrefix(str)
+				str = strings.TrimSpace(str)
+				prefix, err := ParsePrefixOrAddr(str)
 				if err != nil {
 					return nil, err
 				}

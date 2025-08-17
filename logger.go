@@ -1,0 +1,44 @@
+package wiresocks
+
+import (
+	"log"
+	"os"
+)
+
+// A Logger provides logging for a Device.
+// The functions are Printf-style functions.
+// They must be safe for concurrent use.
+// They do not require a trailing newline in the format.
+// If nil, that level of logging will be silent.
+type Logger struct {
+	LogLevel int
+	Verbosef func(format string, args ...any)
+	Errorf   func(format string, args ...any)
+}
+
+// Log levels for use with NewLogger.
+const (
+	LogLevelSilent = iota
+	LogLevelError
+	LogLevelVerbose
+)
+
+// DiscardLogf Function for use in Logger for discarding logged lines.
+func DiscardLogf(format string, args ...any) {}
+
+// NewLogger constructs a Logger that writes to stdout.
+// It logs at the specified log level and above.
+// It decorates log lines with the log level, date, time, and prepend.
+func NewLogger(level int) *Logger {
+	logger := &Logger{level, DiscardLogf, DiscardLogf}
+	logf := func(prefix string) func(string, ...any) {
+		return log.New(os.Stdout, prefix+": ", log.Ldate|log.Ltime).Printf
+	}
+	if level >= LogLevelVerbose {
+		logger.Verbosef = logf("DEBUG")
+	}
+	if level >= LogLevelError {
+		logger.Errorf = logf("ERROR")
+	}
+	return logger
+}

@@ -26,7 +26,7 @@ LABEL org.opencontainers.image.source="https://github.com/shahradelahi/wiresocks
 LABEL org.opencontainers.image.licenses="MIT"
 
 # Add ca-certificates and create a non-root user named 'wiresocks'
-RUN apk add --no-cache ca-certificates && \
+RUN apk add --no-cache ca-certificates net-tools && \
     addgroup -S wiresocks && \
     adduser -S wiresocks -G wiresocks
 

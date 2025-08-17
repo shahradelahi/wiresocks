@@ -1,0 +1,35 @@
+services:
+  wiresocks:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: wiresocks
+    container_name: wiresocks
+    ports:
+      # Expose the SOCKS5 proxy on port 1080
+      - "1080:1080"
+      # Expose the HTTP proxy on port 8118
+      - "8118:8118"
+    volumes:
+      # Mount your local WireGuard configuration file
+      # Make sure to create a 'config.conf' file in the same directory
+      # as this docker-compose.yml file.
+      - ./config.conf:/etc/wiresocks/config.conf:ro
+    command:
+      # Path to the configuration file inside the container
+      - "--config"
+      - "/etc/wiresocks/config.conf"
+      # Bind the SOCKS5 proxy to 0.0.0.0 to make it accessible from outside
+      - "--socks-addr"
+      - "0.0.0.0:1080"
+      # Bind the HTTP proxy to 0.0.0.0 to make it accessible from outside
+      - "--http-addr"
+      - "0.0.0.0:8118"
+    healthcheck:
+      test: ["CMD-SHELL", "netstat -lnt | grep -q ':1080' && netstat -lnt | grep -q ':8118'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+

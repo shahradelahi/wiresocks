@@ -2,44 +2,42 @@ package statute
 
 import (
 	"context"
-	"fmt"
-	"io"
 	"net"
 )
 
-type Logger interface {
-	Debug(v ...interface{})
-	Error(v ...interface{})
+// CredentialStore is an interface for storing and validating user credentials.
+type CredentialStore interface {
+	Valid(user, password string) bool
 }
 
-type DefaultLogger struct{}
+// StaticCredentials stores a map of username to password.
+type StaticCredentials map[string]string
 
-func (l DefaultLogger) Debug(v ...interface{}) {
-	fmt.Println(v...)
+// Valid checks if the given user and password are valid.
+func (s StaticCredentials) Valid(user, password string) bool {
+	pass, ok := s[user]
+	if !ok {
+		return false
+	}
+	return pass == password
 }
 
-func (l DefaultLogger) Error(v ...interface{}) {
-	fmt.Println(v...)
+// NameResolver is used to implement custom name resolution
+type NameResolver interface {
+	Resolve(ctx context.Context, name string) (context.Context, net.IP, error)
 }
 
-type ProxyRequest struct {
-	Conn        net.Conn
-	Reader      io.Reader
-	Writer      io.Writer
-	Network     string
-	Destination string
-	DestHost    string
-	DestPort    int32
+// DefaultResolver uses the system DNS to resolve host names
+type DefaultResolver struct{}
+
+// Resolve implement interface NameResolver
+func (d DefaultResolver) Resolve(ctx context.Context, name string) (context.Context, net.IP, error) {
+	addr, err := net.ResolveIPAddr("ip", name)
+	if err != nil {
+		return ctx, nil, err
+	}
+	return ctx, addr.IP, err
 }
-
-// UserConnectHandler is used for socks5, socks4 and http
-type UserConnectHandler func(request *ProxyRequest) error
-
-// UserBindHandler is used for socks4
-type UserBindHandler func(request *ProxyRequest) error
-
-// UserAssociateHandler is used for socks5
-type UserAssociateHandler func(request *ProxyRequest) error
 
 // ProxyDialFunc is used for socks5, socks4 and http
 type ProxyDialFunc func(ctx context.Context, network string, address string) (net.Conn, error)
@@ -75,5 +73,3 @@ type BytesPool interface {
 func DefaultContext() context.Context {
 	return context.Background()
 }
-
-const DefaultBindAddress = "127.0.0.1:1080"

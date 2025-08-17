@@ -45,24 +45,26 @@ func errno(v error) uintptr {
 
 // Tunnel create tunnels for two io.ReadWriteCloser
 func Tunnel(ctx context.Context, c1, c2 io.ReadWriteCloser, buf1, buf2 []byte) error {
-	ctx, cancel := context.WithCancel(ctx)
-	var errs tunnelErr
+	errCh := make(chan error, 2)
 	go func() {
-		_, errs[0] = io.CopyBuffer(c1, c2, buf1)
-		cancel()
+		_, err := io.CopyBuffer(c1, c2, buf1)
+		errCh <- err
 	}()
 	go func() {
-		_, errs[1] = io.CopyBuffer(c2, c1, buf2)
-		cancel()
+		_, err := io.CopyBuffer(c2, c1, buf2)
+		errCh <- err
 	}()
-	<-ctx.Done()
-	errs[2] = c1.Close()
-	errs[3] = c2.Close()
-	errs[4] = ctx.Err()
-	if errs[4] == context.Canceled {
-		errs[4] = nil
+	defer func() {
+		_ = c1.Close()
+		_ = c2.Close()
+	}()
+
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	return errs.FirstError()
 }
 
 type tunnelErr [5]error

@@ -1,6 +1,6 @@
 BINARY := wiresocks
 MODULE := github.com/shahradelahi/wiresocks
-ENTRY := cmd/main.go
+ENTRY := cmd/wiresocks/main.go
 
 BUILD_DIR     := build
 BUILD_TAGS    :=

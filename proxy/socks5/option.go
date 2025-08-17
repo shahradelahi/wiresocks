@@ -2,27 +2,22 @@ package socks5
 
 import (
 	"context"
+	"net"
 
 	"github.com/shahradelahi/wiresocks/proxy/statute"
 )
 
 type ServerOption func(*Server)
 
+func WithListener(ln net.Listener) ServerOption {
+	return func(s *Server) {
+		s.Listener = ln
+	}
+}
+
 func WithBind(bindAddress string) ServerOption {
 	return func(s *Server) {
 		s.Bind = bindAddress
-	}
-}
-
-func WithConnectHandle(handler statute.UserConnectHandler) ServerOption {
-	return func(s *Server) {
-		s.UserConnectHandle = handler
-	}
-}
-
-func WithAssociateHandle(handler statute.UserAssociateHandler) ServerOption {
-	return func(s *Server) {
-		s.UserAssociateHandle = handler
 	}
 }
 
@@ -44,9 +39,15 @@ func WithPacketForwardAddress(packetForwardAddress statute.PacketForwardAddress)
 	}
 }
 
-func WithCredentials(creds CredentialStore) ServerOption {
+func WithCredentials(creds statute.CredentialStore) ServerOption {
 	return func(s *Server) {
 		s.Credentials = creds
+	}
+}
+
+func WithResolver(resolver statute.NameResolver) ServerOption {
+	return func(s *Server) {
+		s.Resolver = resolver
 	}
 }
 

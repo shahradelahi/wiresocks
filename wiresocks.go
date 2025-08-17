@@ -2,41 +2,67 @@ package wiresocks
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"net/netip"
+	"time"
 
-	"github.com/shahradelahi/wiresocks/log"
+	"github.com/amnezia-vpn/amneziawg-go/tun/netstack"
+
+	"github.com/shahradelahi/wiresocks/proxy/http"
+	"github.com/shahradelahi/wiresocks/proxy/socks5"
+	"github.com/shahradelahi/wiresocks/proxy/statute"
 )
 
+// ProxyConfig holds the configuration for the proxies.
+type ProxyConfig struct {
+	SocksBindAddr *netip.AddrPort
+	HttpBindAddr  *netip.AddrPort
+	Username      string
+	Password      string
+}
+
+// ConnectivityTestOptions holds the configuration for the connectivity test.
+type ConnectivityTestOptions struct {
+	Enabled bool
+	URL     string
+	Timeout time.Duration
+}
+
 type WireSocks struct {
-	conf             *Configuration
-	socksBindAddress *netip.AddrPort
-	httpBindAddress  *netip.AddrPort
-	testURL          string
+	conf                 *Configuration
+	socksBindAddress     *netip.AddrPort
+	httpBindAddress      *netip.AddrPort
+	username             string
+	password             string
+	connectivityTestOpts *ConnectivityTestOptions
+
+	vt      *VirtualTun
+	httpLn  net.Listener
+	socksLn net.Listener
+	errCh   chan error
+
+	logger *Logger
 
 	ctx    context.Context
 	cancel context.CancelFunc
 }
 
-func NewWireSocks(options ...option) (*WireSocks, error) {
-	dnsServers := []string{"1.1.1.1", "1.0.0.1"}
-
-	log.Debugf("Initializing WireSocks with default DNS servers: %v", dnsServers)
-
+func NewWireSocks(options ...Option) (*WireSocks, error) {
 	var dnsAddrs []netip.Addr
-	for _, dns := range dnsServers {
-		addr, err := netip.ParseAddr(dns)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse DNS server: %v", err)
-		}
+	for _, dns := range []string{"1.1.1.1", "1.0.0.1", "2606:4700:4700::1112", "2606:4700:4700::1112"} {
+		addr := netip.MustParseAddr(dns)
 		dnsAddrs = append(dnsAddrs, addr)
 	}
+
+	logger := NewLogger(LogLevelError)
 
 	iface := InterfaceConfig{
 		DNS:        dnsAddrs,
 		PrivateKey: "",
 		Addresses:  []netip.Prefix{},
-		MTU:        1330,
+		MTU:        1280,
 		FwMark:     0x0,
 	}
 
@@ -47,130 +73,252 @@ func NewWireSocks(options ...option) (*WireSocks, error) {
 			Interface: &iface,
 			Peers:     []PeerConfig{},
 		},
-		ctx:     ctx,
-		testURL: "https://1.1.1.1/cdn-cgi/trace/",
-		cancel:  cancel,
+		connectivityTestOpts: &ConnectivityTestOptions{
+			Enabled: false,
+			URL:     "https://1.1.1.1/cdn-cgi/trace/",
+			Timeout: 10 * time.Second,
+		},
+
+		logger: logger,
+
+		ctx:    ctx,
+		cancel: cancel,
 	}
 
 	for _, option := range options {
 		option(s)
 	}
 
-	log.Debugf("WireSocks instance created with initial configuration.")
 	return s, nil
 }
 
 func (s *WireSocks) Run() error {
-	log.Infof("Starting WireSocks main run loop.")
-	s.conf.Interface.MTU = 1330
-	log.Debugf("Setting interface MTU to: %d", s.conf.Interface.MTU)
-
-	resolver := "1.1.1.1" // Default resolver
-	s.conf.Interface.DNS = []netip.Addr{netip.MustParseAddr("1.1.1.1")}
-	log.Debugf("Setting DNS resolver to: %s", resolver)
-
-	// Enable keepalive on all peers in conf
-	for i, peer := range s.conf.Peers {
-		peer.KeepAlive = 5
-		log.Debugf("Setting KeepAlive for peer %d to %d seconds.", i, peer.KeepAlive)
-
-		addr, err := ParseResolveAddressPort(peer.Endpoint, true, resolver)
-		if err == nil {
-			log.Debugf("Resolved peer endpoint %s to %s", peer.Endpoint, addr.String())
-			peer.Endpoint = addr.String()
-		} else {
-			log.Warnf("Failed to resolve peer endpoint: %s, using original. Error: %v", peer.Endpoint, err)
-		}
-
-		s.conf.Peers[i] = peer
+	if s.socksBindAddress == nil && s.httpBindAddress == nil {
+		return errors.New("no proxy listeners configured")
 	}
 
 	// Establish wireguard on userspace stack
-	log.Debugf("Attempting to create WireGuard device.")
-	dev, tnet, err := createWireguardDevice(s.ctx, s.conf, s.testURL)
+	vt, err := s.startWireguard()
 	if err != nil {
-		log.Fatalf("Failed to create WireGuard device: %v", err)
 		return err
 	}
-	if dev != nil {
+	s.vt = vt
+	if s.vt.Dev != nil {
 		defer func() {
-			log.Infof("Closing WireGuard device.")
-			dev.Close()
+			s.vt.Dev.Close()
 		}()
 	}
 
-	opts := &ProxyOptions{
-		SocksBindAddress: s.socksBindAddress,
-		HttpBindAddress:  s.httpBindAddress,
+	if s.connectivityTestOpts.Enabled {
+		s.logger.Verbosef("Wiresocks: Performing connectivity test.")
+		if err := s.vt.CheckConnectivity(s.ctx, s.connectivityTestOpts.URL, s.connectivityTestOpts.Timeout); err != nil {
+			return fmt.Errorf("connectivity test failed: %w", err)
+		}
 	}
 
-	proxy := NewProxyServer(tnet, opts)
-	log.Infof("Starting proxy server.")
-	if err := proxy.Start(); err != nil {
-		log.Fatalf("Failed to start proxy server: %v", err)
+	s.errCh = make(chan error, 2)
+
+	if s.socksBindAddress != nil {
+		if err := s.startSocksProxy(); err != nil {
+			return err
+		}
+	}
+
+	if s.httpBindAddress != nil {
+		if err := s.startHttpProxy(); err != nil {
+			return err
+		}
+	}
+
+	go func() {
+		<-s.ctx.Done()
+		s.vt.Stop()
+		s.closeListeners()
+	}()
+
+	select {
+	case err := <-s.errCh:
+		s.Stop()
 		return err
+	case <-s.ctx.Done():
+		return nil
 	}
-
-	log.Infof("WireSocks is running. Waiting for shutdown signal.")
-	<-s.ctx.Done()
-
-	log.Infof("Shutdown signal received. Stopping proxy server.")
-	proxy.Stop()
-
-	log.Infof("WireSocks main run loop finished.")
-	return nil
 }
 
 func (s *WireSocks) Stop() {
-	log.Infof("Initiating WireSocks shutdown.")
+	s.logger.Verbosef("Wiresocks: Stopping WireSocks.")
 	s.cancel()
+	s.closeListeners()
 }
 
-type option func(*WireSocks)
-
-func (s *WireSocks) WithTestURL(testURL string) {
-	s.testURL = testURL
-	log.Debugf("Set test URL to: %s", testURL)
-}
-
-func (s *WireSocks) WithPeer(peer PeerConfig) {
-	s.conf.Peers = append(s.conf.Peers, peer)
-	log.Debugf("Added peer with public key (first 8 chars): %s", peer.PublicKey[:8])
-}
-
-func (s *WireSocks) WithPrivateKey(key string) {
-	s.conf.Interface.PrivateKey = key
-	log.Debugf("Set private key (first 8 chars): %s", key[:8])
-}
-
-func (s *WireSocks) WithConfig(conf *Configuration) {
-	s.conf = conf
-	log.Debugf("Set configuration from external source.")
-}
-
-func (s *WireSocks) WithSocksBindAddr(addr *netip.AddrPort) {
-	s.socksBindAddress = addr
-	log.Debugf("Set SOCKS bind address to: %s", addr.String())
-}
-
-func (s *WireSocks) WithHTTPBindAddr(addr *netip.AddrPort) {
-	s.httpBindAddress = addr
-	log.Debugf("Set HTTP bind address to: %s", addr.String())
-}
-
-func (s *WireSocks) WithProxyOptions(opts *ProxyOptions) {
-	s.socksBindAddress = opts.SocksBindAddress
-	s.httpBindAddress = opts.HttpBindAddress
-	var socksAddr, httpAddr string
-	if opts.SocksBindAddress != nil {
-		socksAddr = opts.SocksBindAddress.String()
-	} else {
-		socksAddr = "disabled"
+func (s *WireSocks) closeListeners() {
+	if s.httpLn != nil {
+		_ = s.httpLn.Close()
 	}
-	if opts.HttpBindAddress != nil {
-		httpAddr = opts.HttpBindAddress.String()
-	} else {
-		httpAddr = "disabled"
+	if s.socksLn != nil {
+		_ = s.socksLn.Close()
 	}
-	log.Debugf("Set proxy options with SOCKS bind address: %s and HTTP bind address: %s", socksAddr, httpAddr)
+}
+
+func (s *WireSocks) startSocksProxy() error {
+	ln, err := net.Listen("tcp", s.socksBindAddress.String())
+	if err != nil {
+		return fmt.Errorf("failed to listen on Socks5 address %s: %v", s.socksBindAddress.String(), err)
+	}
+
+	if s.socksLn != nil {
+		_ = s.socksLn.Close()
+	}
+	s.socksLn = ln
+
+	opts := []socks5.ServerOption{
+		socks5.WithListener(s.socksLn),
+		socks5.WithContext(s.ctx),
+		socks5.WithProxyDial(s.vt.Tnet.DialContext),
+		socks5.WithResolver(s.vt),
+	}
+
+	if s.username != "" && s.password != "" {
+		opts = append(opts, socks5.WithCredentials(statute.StaticCredentials{
+			s.username: s.password,
+		}))
+	}
+
+	server := socks5.NewServer(opts...)
+
+	go func() {
+		if err := server.ListenAndServe(); err != nil {
+			s.errCh <- fmt.Errorf("socks5 server server stopped with error: %v", err)
+		}
+	}()
+
+	s.logger.Verbosef("Wiresocks: Started Socks5 proxy server on %s", s.socksBindAddress.String())
+
+	return nil
+}
+
+func (s *WireSocks) startHttpProxy() error {
+	ln, err := net.Listen("tcp", s.httpBindAddress.String())
+	if err != nil {
+		return fmt.Errorf("failed to listen on HTTP address %s: %v", s.httpBindAddress.String(), err)
+	}
+
+	if s.httpLn != nil {
+		_ = s.httpLn.Close()
+	}
+	s.httpLn = ln
+
+	opts := []http.ServerOption{
+		http.WithListener(s.httpLn),
+		http.WithContext(s.ctx),
+		http.WithProxyDial(s.vt.Tnet.DialContext),
+		http.WithResolver(s.vt),
+	}
+
+	if s.username != "" && s.password != "" {
+		opts = append(opts, http.WithCredentials(statute.StaticCredentials{
+			s.username: s.password,
+		}))
+	}
+
+	server := http.NewServer(opts...)
+
+	go func() {
+		if err := server.ListenAndServe(); err != nil {
+			s.errCh <- fmt.Errorf("HTTP server server stopped with error: %v", err)
+		}
+	}()
+
+	s.logger.Verbosef("Wiresocks: Started HTTP proxy server on %s", s.httpBindAddress.String())
+
+	return nil
+}
+
+type Option func(*WireSocks)
+
+func WithLogLevel(loglevel int) Option {
+	return func(s *WireSocks) {
+		s.logger = NewLogger(loglevel)
+	}
+}
+
+func WithContext(ctx context.Context) Option {
+	return func(s *WireSocks) {
+		ctx, cancel := context.WithCancel(ctx)
+		s.ctx = ctx
+		s.cancel = cancel
+	}
+}
+
+func WithPeer(peer PeerConfig) Option {
+	return func(s *WireSocks) {
+		s.conf.Peers = append(s.conf.Peers, peer)
+	}
+}
+
+func WithPrivateKey(key string) Option {
+	return func(s *WireSocks) {
+		s.conf.Interface.PrivateKey = key
+	}
+}
+
+func WithWireguardConfig(conf *Configuration) Option {
+	return func(s *WireSocks) {
+		if conf.Interface != nil {
+			if conf.Interface.PrivateKey != "" {
+				s.conf.Interface.PrivateKey = conf.Interface.PrivateKey
+			}
+			if len(conf.Interface.Addresses) > 0 {
+				s.conf.Interface.Addresses = conf.Interface.Addresses
+			}
+			if len(conf.Interface.DNS) > 0 {
+				s.conf.Interface.DNS = conf.Interface.DNS
+			}
+			if conf.Interface.MTU > 0 {
+				s.conf.Interface.MTU = conf.Interface.MTU
+			}
+			if conf.Interface.FwMark > 0 {
+				s.conf.Interface.FwMark = conf.Interface.FwMark
+			}
+		}
+
+		if len(conf.Peers) > 0 {
+			s.conf.Peers = conf.Peers
+		}
+	}
+}
+
+func WithProxyConfig(opts *ProxyConfig) Option {
+	return func(s *WireSocks) {
+		s.socksBindAddress = opts.SocksBindAddr
+		s.httpBindAddress = opts.HttpBindAddr
+		s.username = opts.Username
+		s.password = opts.Password
+	}
+}
+
+func WithConnectivityTest(opts *ConnectivityTestOptions) Option {
+	return func(s *WireSocks) {
+		s.connectivityTestOpts = opts
+	}
+}
+
+func (s *WireSocks) startWireguard() (*VirtualTun, error) {
+	var interfaceAddrs []netip.Addr
+	for _, prefix := range s.conf.Interface.Addresses {
+		interfaceAddrs = append(interfaceAddrs, prefix.Addr())
+	}
+
+	tunDev, tnet, err := netstack.CreateNetTUN(interfaceAddrs, s.conf.Interface.DNS, s.conf.Interface.MTU)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create netstack TUN device: %w", err)
+	}
+
+	s.logger.Verbosef("Wiresocks: Establishing WireGuard connection")
+	dev, err := establishWireguard(s.conf, tunDev, s.logger.LogLevel)
+	if err != nil {
+		return nil, fmt.Errorf("failed to establish WireGuard connection: %w", err)
+	}
+
+	return &VirtualTun{Tnet: tnet, Dev: dev, ctx: s.ctx}, nil
 }

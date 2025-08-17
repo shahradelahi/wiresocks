@@ -4,17 +4,19 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"strconv"
+	"net/netip"
 	"strings"
 
-	"github.com/shahradelahi/wiresocks/log"
 	"github.com/shahradelahi/wiresocks/proxy/statute"
 )
 
 const (
+	defaultBindAddress = "127.0.0.1:8118"
+
 	// Default ports
 	defaultHTTPPort  = "80"
 	defaultHTTPSPort = "443"
@@ -45,23 +47,34 @@ type Server struct {
 	// ProxyDial specifies the optional proxyDial function for
 	// establishing the transport connection.
 	ProxyDial statute.ProxyDialFunc
-	// UserConnectHandle gives the user control to handle the TCP CONNECT requests
-	UserConnectHandle statute.UserConnectHandler
+	// Resolver specifies the optional name resolver.
+	Resolver statute.NameResolver
 	// Context is default context
 	Context context.Context
 	// BytesPool getting and returning temporary bytes for use by io.CopyBuffer
 	BytesPool statute.BytesPool
+	// Credentials provided for username/password authentication
+	Credentials statute.CredentialStore
+	// Authenticator is used to authenticate users.
+	Authenticator Authenticator
 }
 
 func NewServer(options ...ServerOption) *Server {
 	s := &Server{
-		Bind:      statute.DefaultBindAddress,
+		Bind:      defaultBindAddress,
 		ProxyDial: statute.DefaultProxyDial(),
 		Context:   statute.DefaultContext(),
+		Resolver:  &statute.DefaultResolver{},
 	}
 
 	for _, option := range options {
 		option(s)
+	}
+
+	if s.Authenticator == nil {
+		s.Authenticator = &BasicAuthenticator{
+			Credentials: s.Credentials,
+		}
 	}
 
 	return s
@@ -84,8 +97,6 @@ func (s *Server) ListenAndServe() error {
 		_ = s.Listener.Close()
 	}()
 
-	log.Infof("HTTP proxy server listening on %s", s.Bind)
-
 	// Create a cancelable context based on s.Context
 	ctx, cancel := context.WithCancel(s.Context)
 	defer cancel() // Ensure resources are cleaned up
@@ -94,27 +105,23 @@ func (s *Server) ListenAndServe() error {
 	for {
 		select {
 		case <-ctx.Done():
-			log.Infof("HTTP proxy server shutting down: %v", ctx.Err())
-			return ctx.Err()
+			return fmt.Errorf("HTTP proxy server shutting down: %w", ctx.Err())
 		default:
 			conn, err := s.Listener.Accept()
 			if err != nil {
-				log.Errorf("Failed to accept incoming HTTP connection: %v", err)
-				continue
+				if errors.Is(err, net.ErrClosed) {
+					return nil
+				}
+				return fmt.Errorf("failed to accept incoming HTTP connection: %w", err)
 			}
-			log.Debugf("Accepted new HTTP connection from %s", conn.RemoteAddr())
 
 			// Start a new goroutine to handle each connection
 			// This way, the server can handle multiple connections concurrently
 			go func() {
 				defer func() {
-					log.Debugf("Closing HTTP connection from %s", conn.RemoteAddr())
 					_ = conn.Close()
 				}()
-				err := s.ServeConn(conn)
-				if err != nil && err != io.EOF {
-					log.Errorf("Error serving HTTP connection from %s: %v", conn.RemoteAddr(), err)
-				}
+				_ = s.ServeConn(conn) // Maybe an error channel?
 			}()
 		}
 	}
@@ -124,26 +131,27 @@ func (s *Server) ServeConn(conn net.Conn) error {
 	reader := bufio.NewReader(conn)
 	req, err := http.ReadRequest(reader)
 	if err != nil {
-		if err == io.EOF {
-			log.Debugf("HTTP connection closed by client: %v", err)
-			return nil
+		if errors.Is(err, io.EOF) {
+			return nil // Client closed connection
 		}
-		log.Errorf("Failed to read HTTP request from %s: %v", conn.RemoteAddr(), err)
-		return err
+		return fmt.Errorf("failed to read HTTP request from %s: %w", conn.RemoteAddr(), err)
 	}
 
-	log.Debugf("Received HTTP request: Method=%s, Host=%s, URL=%s from %s", req.Method, req.Host, req.URL.String(), conn.RemoteAddr())
+	if s.Authenticator != nil && !s.Authenticator.Authenticate(req) {
+		w := NewHTTPResponseWriter(conn)
+		w.Header().Set("Proxy-Authenticate", "Basic realm=\"wiresocks\"")
+		w.WriteHeader(http.StatusProxyAuthRequired)
+		return fmt.Errorf("authentication failed for %s", conn.RemoteAddr())
+	}
 
 	// Handle IP proxying requests (RFC 9484)
 	if req.Method == http.MethodGet &&
 		strings.EqualFold(req.Header.Get(connectionHeader), upgrade) &&
 		strings.EqualFold(req.Header.Get(upgradeHeader), connectIP) {
-		log.Infof("Handling IP proxying request from %s to %s", conn.RemoteAddr(), req.URL.String())
 		return s.handleIPProxy(conn, req)
 	}
 
 	// Handle standard HTTP proxy requests
-	log.Infof("Handling standard HTTP proxy request from %s: Method=%s, Host=%s", conn.RemoteAddr(), req.Method, req.URL.Host)
 	return s.handleHTTP(conn, req, req.Method == http.MethodConnect)
 }
 
@@ -151,105 +159,60 @@ func (s *Server) ServeConn(conn net.Conn) error {
 func (s *Server) handleIPProxy(conn net.Conn, req *http.Request) error {
 	// As per RFC 9484, the "Capsule-Protocol" header must be present.
 	if req.Header.Get(capsuleProtocolHeader) != "?1" {
-		log.Warnf("Missing or invalid Capsule-Protocol header from %s. Value: %s", conn.RemoteAddr(), req.Header.Get(capsuleProtocolHeader))
 		w := NewHTTPResponseWriter(conn)
 		http.Error(w, "Capsule-Protocol header required for connect-ip", http.StatusBadRequest)
-		return errors.New("missing Capsule-Protocol header")
+		return fmt.Errorf("missing or invalid Capsule-Protocol header from %s: %s", conn.RemoteAddr(), req.Header.Get(capsuleProtocolHeader))
 	}
 
 	// Respond with 101 Switching Protocols to establish the tunnel.
-	log.Debugf("Sending 101 Switching Protocols to %s", conn.RemoteAddr())
 	if _, err := conn.Write([]byte(httpSwitchingProtocols)); err != nil {
-		log.Errorf("Failed to write 101 Switching Protocols to %s: %v", conn.RemoteAddr(), err)
-		return err
+		return fmt.Errorf("failed to write 101 Switching Protocols to %s: %w", conn.RemoteAddr(), err)
 	}
-
-	log.Infof("IP proxy tunnel established for %s. Waiting for client to close.", conn.RemoteAddr())
 
 	// TODO: Implement full IP proxying with capsule and datagram handling.
 	// For now, we just keep the connection open to represent the tunnel.
 	// This will block until the client closes the connection.
 	_, err := io.Copy(io.Discard, conn)
-	if err != nil && err != io.EOF {
-		log.Errorf("Error during IP proxy tunnel data discard for %s: %v", conn.RemoteAddr(), err)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return fmt.Errorf("error during IP proxy tunnel data discard for %s: %w", conn.RemoteAddr(), err)
 	}
-	log.Infof("IP proxy tunnel for %s closed.", conn.RemoteAddr())
 	return err
 }
 
 func (s *Server) handleHTTP(conn net.Conn, req *http.Request, isConnectMethod bool) error {
-	if s.UserConnectHandle == nil {
-		log.Debugf("Using embedded HTTP connect handler for %s", conn.RemoteAddr())
-		return s.embedHandleHTTP(conn, req, isConnectMethod)
-	}
+	host, port, targetAddr := getTarget(req, isConnectMethod)
 
-	if isConnectMethod {
-		log.Debugf("Sending 200 Connection Established for CONNECT method to %s", conn.RemoteAddr())
-		if _, err := conn.Write([]byte(httpConnectionEstablished)); err != nil {
-			log.Errorf("Failed to write 200 Connection Established to %s: %v", conn.RemoteAddr(), err)
-			return err
-		}
-	} else {
-		// For non-CONNECT methods, we wrap the connection to prepend the request data.
-		log.Debugf("Wrapping connection for non-CONNECT method for %s", conn.RemoteAddr())
-		conn = &customConn{
-			Conn: conn,
-			req:  req,
+	if s.Resolver != nil {
+		if _, err := netip.ParseAddr(host); err != nil {
+			// It's not an IP, so it's a domain name that needs to be resolved.
+			_, resolvedIP, err := s.Resolver.Resolve(s.Context, host)
+			if err != nil {
+				return fmt.Errorf("failed to resolve destination %s: %w", host, err)
+			}
+			targetAddr = net.JoinHostPort(resolvedIP.String(), port)
 		}
 	}
 
-	host, portStr, targetAddr := getTarget(req, isConnectMethod)
-	log.Debugf("Resolved target for %s: host=%s, port=%s, addr=%s", conn.RemoteAddr(), host, portStr, targetAddr)
-
-	portInt, err := strconv.Atoi(portStr)
-	if err != nil {
-		log.Errorf("Failed to parse port %s for %s: %v", portStr, conn.RemoteAddr(), err)
-		return err
-	}
-
-	proxyReq := &statute.ProxyRequest{
-		Conn:        conn,
-		Reader:      io.Reader(conn),
-		Writer:      io.Writer(conn),
-		Network:     "tcp",
-		Destination: targetAddr,
-		DestHost:    host,
-		DestPort:    int32(portInt),
-	}
-
-	log.Infof("Invoking user connect handler for %s to %s", conn.RemoteAddr(), targetAddr)
-	return s.UserConnectHandle(proxyReq)
-}
-
-func (s *Server) embedHandleHTTP(conn net.Conn, req *http.Request, isConnectMethod bool) error {
-	_, _, targetAddr := getTarget(req, isConnectMethod)
-	log.Debugf("Attempting to dial target %s for %s", targetAddr, conn.RemoteAddr())
 	target, err := s.ProxyDial(s.Context, "tcp", targetAddr)
 	if err != nil {
-		log.Errorf("Failed to dial target %s for %s: %v", targetAddr, conn.RemoteAddr(), err)
 		http.Error(
 			NewHTTPResponseWriter(conn),
 			err.Error(),
 			http.StatusServiceUnavailable,
 		)
-		return err
+		return fmt.Errorf("failed to dial target %s for %s: %w", targetAddr, conn.RemoteAddr(), err)
 	}
 	defer func() {
-		log.Debugf("Closing target connection to %s for %s", targetAddr, conn.RemoteAddr())
 		_ = target.Close()
 	}()
 
 	if isConnectMethod {
-		log.Debugf("Sending 200 Connection Established for CONNECT method to %s", conn.RemoteAddr())
 		if _, err = conn.Write([]byte(httpConnectionEstablished)); err != nil {
-			log.Errorf("Failed to write 200 Connection Established to %s: %v", conn.RemoteAddr(), err)
-			return err
+			return fmt.Errorf("failed to write 200 Connection Established to %s: %w", conn.RemoteAddr(), err)
 		}
 	} else {
-		log.Debugf("Writing request to target %s for %s", targetAddr, conn.RemoteAddr())
 		if err = req.Write(target); err != nil {
-			log.Errorf("Failed to write request to target %s for %s: %v", targetAddr, conn.RemoteAddr(), err)
-			return err
+			return fmt.Errorf("failed to write request to target %s for %s: %w", targetAddr, conn.RemoteAddr(), err)
 		}
 	}
 
@@ -261,13 +224,10 @@ func (s *Server) embedHandleHTTP(conn net.Conn, req *http.Request, isConnectMeth
 			s.BytesPool.Put(buf1)
 			s.BytesPool.Put(buf2)
 		}()
-		log.Debugf("Using pooled buffers for tunneling between %s and %s", conn.RemoteAddr(), targetAddr)
 	} else {
 		buf1 = make([]byte, 32*1024)
 		buf2 = make([]byte, 32*1024)
-		log.Debugf("Using default buffers for tunneling between %s and %s", conn.RemoteAddr(), targetAddr)
 	}
-	log.Debugf("Tunneling data between %s and %s", conn.RemoteAddr(), targetAddr)
 	return statute.Tunnel(s.Context, target, conn, buf1, buf2)
 }
 
@@ -282,7 +242,6 @@ func getTarget(req *http.Request, isConnect bool) (host, port, addr string) {
 		} else {
 			port = defaultHTTPPort
 		}
-		log.Debugf("Using default port %s for host %s (isConnect: %t, scheme: %s)", port, host, isConnect, req.URL.Scheme)
 	}
 	addr = net.JoinHostPort(host, port)
 	return

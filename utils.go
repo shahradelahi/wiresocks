@@ -114,6 +114,30 @@ func ParseResolveAddressPort(hostname string, includev6 bool, dnsServer string) 
 	return netip.AddrPort{}, errors.New("no valid IP addresses found")
 }
 
+// ParsePrefixOrAddr parses s as a netip.Prefix. If that fails, it
+// parses s as a netip.Addr and returns it as a full-prefix.
+func ParsePrefixOrAddr(s string) (netip.Prefix, error) {
+	if p, err := netip.ParsePrefix(s); err == nil {
+		return p, nil
+	}
+	addr, err := netip.ParseAddr(s)
+	if err != nil {
+		return netip.Prefix{}, fmt.Errorf("parsing %q: %w", s, err)
+	}
+	return netip.PrefixFrom(addr, addr.BitLen()), nil
+}
+
+// MustParsePrefixOrAddr parses s as a netip.Prefix. If that fails, it
+// parses s as a netip.Addr and returns it as a full-prefix.
+// It panics if parsing as an address fails.
+func MustParsePrefixOrAddr(s string) netip.Prefix {
+	p, err := ParsePrefixOrAddr(s)
+	if err != nil {
+		panic(err)
+	}
+	return p
+}
+
 func EncodeHexToBase64(key string) (string, error) {
 	decoded, err := hex.DecodeString(key)
 	if err != nil {

@@ -2,15 +2,58 @@ package http
 
 import (
 	"bytes"
+	"encoding/base64"
 	"fmt"
 	"net"
 	"net/http"
-	"sync"
+	"strings"
+
+	"github.com/shahradelahi/wiresocks/proxy/statute"
 )
 
 const (
 	CRLF = "\r\n"
 )
+
+// Authenticator is an interface for authenticating users.
+type Authenticator interface {
+	Authenticate(req *http.Request) bool
+}
+
+// BasicAuthenticator is an Authenticator that uses basic authentication.
+type BasicAuthenticator struct {
+	Credentials statute.CredentialStore
+}
+
+// Authenticate authenticates the user using basic authentication.
+func (a *BasicAuthenticator) Authenticate(req *http.Request) bool {
+	if a.Credentials == nil {
+		return true
+	}
+
+	authHeader := req.Header.Get("Proxy-Authorization")
+	if authHeader == "" {
+		return false
+	}
+
+	const prefix = "Basic "
+	if !strings.HasPrefix(authHeader, prefix) {
+		return false
+	}
+
+	encoded := authHeader[len(prefix):]
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return false
+	}
+
+	parts := strings.SplitN(string(decoded), ":", 2)
+	if len(parts) != 2 {
+		return false
+	}
+
+	return a.Credentials.Valid(parts[0], parts[1])
+}
 
 // copyBuffer is a helper function to copy data between two net.Conn objects.
 // func copyBuffer(dst, src net.Conn, buf []byte) (int64, error) {
@@ -60,31 +103,4 @@ func (rw *responseWriter) Write(data []byte) (int, error) {
 		rw.WriteHeader(http.StatusOK)
 	}
 	return rw.conn.Write(data)
-}
-
-type customConn struct {
-	net.Conn
-	req         *http.Request
-	initialData []byte
-	once        sync.Once
-}
-
-func (c *customConn) Read(p []byte) (n int, err error) {
-	c.once.Do(func() {
-		buf := &bytes.Buffer{}
-		err = c.req.Write(buf)
-		if err != nil {
-			n = 0
-			return
-		}
-		c.initialData = buf.Bytes()
-	})
-
-	if len(c.initialData) > 0 {
-		n = copy(p, c.initialData)
-		c.initialData = c.initialData[n:]
-		return
-	}
-
-	return c.Conn.Read(p)
 }

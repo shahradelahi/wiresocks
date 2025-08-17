@@ -1,7 +1,7 @@
 # 🔌 wiresocks
 
 [![MIT licensed](https://img.shields.io/badge/license-MIT-blue)](./LICENSE) 
-[![Go Report Card](https://goreportcard.com/badge/github.com/shahradelahi/wiresocks)](https://goreportcard.com/report/github.com/shahradelahi/wiresocks)
+[![Go Report Card](https://goreportcard.com/badge/github.com/shahradelahi/wiresocks)](https://goreportcard.com/report/github.com/shahradelahi/wiresocks) 
 [![Go Reference](https://pkg.go.dev/badge/github.com/shahradelahi/wiresocks.svg)](https://pkg.go.dev/github.com/shahradelahi/wiresocks)
 
 A user-space WireGuard client that exposes a SOCKS and HTTP proxy.
@@ -9,6 +9,26 @@ A user-space WireGuard client that exposes a SOCKS and HTTP proxy.
 `wiresocks` allows you to connect to a WireGuard peer and route traffic from any application through the tunnel by
 connecting to the local proxy server. It runs entirely in user-space, meaning it does not require elevated privileges to
 operate.
+
+## Table of Contents
+
+- [Motivation](#-motivation)
+- [Features](#-features)
+- [Installation](#-installation)
+  - [From Source (Recommended)](#from-source-recommended)
+  - [From GitHub Releases](#from-github-releases)
+  - [Building from Source](#building-from-source)
+- [Usage](#-usage)
+  - [Command-line Flags](#command-line-flags)
+- [Usage as a Library](#-usage-as-a-library)
+  - [Installation](#installation)
+  - [Example Usage](#example-usage)
+- [Docker](#-docker)
+  - [Building the Image](#building-the-image)
+  - [Running the Container](#running-the-container)
+- [Configuration](#-configuration)
+- [Contributing](#-contributing)
+- [License](#license)
 
 ## 💡 Motivation
 
@@ -23,8 +43,8 @@ Many WireGuard clients require kernel-level access or route all system traffic t
 ## ✨ Features
 
 - **User-Space WireGuard:** Connects to a WireGuard peer without needing kernel modules or root access.
-- **SOCKS and HTTP Proxy:** Exposes both SOCKS and HTTP proxies to tunnel application traffic.
-- **Full SOCKS Support:** Implements SOCKS4, SOCKS4a, and SOCKS5 with TCP (`CONNECT`) and UDP (`ASSOCIATE`) support.
+- **SOCKS and HTTP Proxy:** Exposes both SOCKS and HTTP proxies to tunnel application traffic, with optional authentication.
+- **Full SOCKS Support:** Implements SOCKS5 with TCP (`CONNECT`) and UDP (`ASSOCIATE`) support.
 - **Standard Configuration:** Uses a standard `wg-quick`-style configuration file.
 - **Cross-Platform:** Written in Go, it can be built for Linux, macOS, Windows, and more.
 
@@ -67,16 +87,114 @@ Run `wiresocks` from the command line, providing the path to your WireGuard conf
 
 ### Command-line Flags
 
-- `-c <path>`: Path to the WireGuard configuration file (default: `./config.conf`).
-- `-s <addr:port>`: SOCKS proxy bind address (default: `127.0.0.1:1080`). Use an empty string to disable.
-- `-h <addr:port>`: HTTP proxy bind address. Disabled by default.
-- `-v`: Enable verbose logging.
-- `-version`: Show version information and exit.
+- `-c`, `--config <path>`: Path to the WireGuard configuration file (default: `./config.conf`).
+- `--socks-addr <addr:port>`: SOCKS5 proxy bind address.
+- `--http-addr <addr:port>`: HTTP proxy bind address.
+- `-p`, `--password <password>`: Proxy password for authentication (optional).
+- `-u`, `--username <username>`: Proxy username for authentication (optional).
+- `--silent`: Enable silent mode.
+- `-v`, `--version`: Show version information and exit.
 
 **Example:** Run with a SOCKS proxy on port 1080 and an HTTP proxy on port 8118.
 
 ```bash
-./build/wiresocks -c /etc/wireguard/wg0.conf -s 127.0.0.1:1080 -h 127.0.0.1:8118
+./build/wiresocks -c /etc/wireguard/wg0.conf --socks-addr 127.0.0.1:1080 --http-addr 127.0.0.1:8118
+```
+
+## 📚 Usage as a Library
+
+`wiresocks` can also be used as a library in your Go projects to embed WireGuard proxy functionality directly into your applications.
+
+### Installation
+
+To add `wiresocks` to your Go project, use `go get`:
+
+```bash
+go get github.com/shahradelahi/wiresocks
+```
+
+### Example Usage
+
+Here's a basic example of how to start a `wiresocks` instance programmatically:
+
+```go
+package main
+
+import (
+	"context"
+	"log"
+	"net/netip"
+	"time"
+
+	"github.com/shahradelahi/wiresocks"
+)
+
+func main() {
+	// Define WireGuard interface configuration
+	iface := wiresocks.InterfaceConfig{
+		PrivateKey: "YOUR_PRIVATE_KEY_HEX", // Replace with your actual private key
+		Addresses: []netip.Prefix{
+			netip.MustParsePrefix("10.0.0.2/32"),
+		},
+		DNS: []netip.Addr{
+			netip.MustParseAddr("1.1.1.1"),
+		},
+		MTU: 1420,
+	}
+
+	// Define WireGuard peer configuration
+	peer := wiresocks.PeerConfig{
+		PublicKey: "PEER_PUBLIC_KEY_HEX",    // Replace with your peer's public key
+		Endpoint:  "peer.example.com:51820", // Replace with your peer's endpoint
+		AllowedIPs: []netip.Prefix{
+			netip.MustParsePrefix("0.0.0.0/0"),
+			netip.MustParsePrefix("::/0"),
+		},
+		PersistentKeepalive: 25,
+	}
+
+	// Define proxy configuration
+	socksAddr := netip.MustParseAddrPort("127.0.0.1:1080")
+	httpAddr := netip.MustParseAddrPort("127.0.0.1:8118")
+	proxyOpts := &wiresocks.ProxyConfig{
+		SocksBindAddr: &socksAddr,
+		HttpBindAddr:  &httpAddr,
+		Username:      "myuser",
+		Password:      "mypassword",
+	}
+
+	// Create a new WireSocks instance
+	ws, err := wiresocks.NewWireSocks(
+		wiresocks.WithContext(context.Background()),
+		wiresocks.WithWireguardConfig(&wiresocks.Configuration{
+			Interface: &iface,
+			Peers:     []wiresocks.PeerConfig{peer},
+		}),
+		wiresocks.WithProxyConfig(proxyOpts),
+		wiresocks.WithLogLevel(wiresocks.LogLevelVerbose),
+		wiresocks.WithConnectivityTest(&wiresocks.ConnectivityTestOptions{
+			Enabled: true,
+			URL:     "https://1.1.1.1/cdn-cgi/trace/",
+			Timeout: 10 * time.Second,
+		}),
+	)
+	if err != nil {
+		log.Fatalf("Failed to create WireSocks instance: %v", err)
+	}
+
+	// Run WireSocks in a goroutine
+	go func() {
+		if err := ws.Run(); err != nil {
+			log.Fatalf("WireSocks failed to run: %v", err)
+		}
+	}()
+
+	// Keep the main goroutine alive until interrupted
+	select {
+	case <-context.Background().Done():
+		// Handle shutdown gracefully
+	}
+}
 ```
 
 ## 🐳 Docker
@@ -159,6 +277,12 @@ Endpoint = <peer-ip-or-hostname>:<peer-port>
 # (Optional) Keepalive interval in seconds
 PersistentKeepalive = 25
 ```
+
+## 🤝 Contributing
+
+Want to contribute? Awesome! To show your support is to star the project, or to raise issues on [GitHub](https://github.com/shahradelahi/wiresocks)
+
+Thanks again for your support, it is much appreciated! 🙏
 
 ## License
 
