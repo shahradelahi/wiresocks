@@ -232,6 +232,21 @@ func ParsePeers(cfg *ini.File) ([]PeerConfig, error) {
 	return peers, nil
 }
 
+// parseConfigFromIni is a shared helper function that parses an ini.File into Configuration
+func parseConfigFromIni(cfg *ini.File) (*Configuration, error) {
+	iface, err := ParseInterface(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	peers, err := ParsePeers(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Configuration{Interface: &iface, Peers: peers}, nil
+}
+
 // ParseConfig takes the path of a configuration file and parses it into Configuration
 func ParseConfig(path string) (*Configuration, error) {
 	iniOpt := ini.LoadOptions{
@@ -245,15 +260,21 @@ func ParseConfig(path string) (*Configuration, error) {
 		return nil, err
 	}
 
-	iface, err := ParseInterface(cfg)
+	return parseConfigFromIni(cfg)
+}
+
+// ParseConfigFromText takes configuration text directly and parses it into Configuration
+func ParseConfigFromText(configText string) (*Configuration, error) {
+	iniOpt := ini.LoadOptions{
+		Insensitive:            true,
+		AllowShadows:           true,
+		AllowNonUniqueSections: true,
+	}
+
+	cfg, err := ini.LoadSources(iniOpt, []byte(configText))
 	if err != nil {
 		return nil, err
 	}
 
-	peers, err := ParsePeers(cfg)
-	if err != nil {
-		return nil, err
-	}
-
-	return &Configuration{Interface: &iface, Peers: peers}, nil
+	return parseConfigFromIni(cfg)
 }
