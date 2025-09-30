@@ -7,12 +7,12 @@ toolchain go1.24.6
 require (
 	github.com/amnezia-vpn/amneziawg-go v0.2.13
 	github.com/go-ini/ini v1.67.0
+	github.com/spf13/cobra v1.9.1
 )
 
 require (
 	github.com/google/btree v1.1.3 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
-	github.com/spf13/cobra v1.9.1 // indirect
 	github.com/spf13/pflag v1.0.6 // indirect
 	github.com/tevino/abool v1.2.0 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
