@@ -6,7 +6,9 @@ on:
       - main
 
 permissions:
+  actions: write
   contents: read
+  id-token: write
 
 jobs:
   upload-coverage:
@@ -14,21 +16,17 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Set up Ruby
-        uses: ruby/setup-ruby@v1
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
-          bundler-cache: true
+          check-latest: true
+          go-version-file: 'go.mod'
 
-      - name: Install dependencies
-        run: bundle install
-
-      - name: Generate coverage report
-        run: bundle exec rake
-        env:
-          COVERAGE: true
-          ISOLATED: true
+      - name: Run tests
+        run: go test -coverprofile=coverage.out
 
       - uses: qltysh/qlty-action/coverage@v2
         with:
+          oidc: true
           token: ${{ secrets.QLTY_COVERAGE_TOKEN }}
           files: coverage/.resultset.json
