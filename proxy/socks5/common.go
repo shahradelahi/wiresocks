@@ -167,15 +167,6 @@ func readBytes(r io.Reader) ([]byte, error) {
 	return bytes, nil
 }
 
-func writeBytes(w io.Writer, b []byte) error {
-	_, err := w.Write([]byte{byte(len(b))})
-	if err != nil {
-		return err
-	}
-	_, err = w.Write(b)
-	return err
-}
-
 func readByte(r io.Reader) (byte, error) {
 	var buf [1]byte
 	_, err := r.Read(buf[:])

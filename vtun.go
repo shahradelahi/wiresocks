@@ -84,7 +84,7 @@ func (vt VirtualTun) CheckConnectivity(ctx context.Context, url string, timeout 
 			DialContext: vt.Tnet.DialContext,
 		}}
 
-		req, err := http.NewRequestWithContext(ctx, "HEAD", url, nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
 		if err != nil {
 			return fmt.Errorf("failed to create connectivity test request: %w", err)
 		}

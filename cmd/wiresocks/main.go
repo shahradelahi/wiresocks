@@ -89,6 +89,7 @@ var rootCmd = &cobra.Command{
 		sigChan := make(chan os.Signal, 1)
 		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
 		logLevel := wiresocks.LogLevelVerbose
 		if silent {

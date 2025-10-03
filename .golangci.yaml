@@ -1,0 +1,40 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: none
+  enable:
+    - cyclop
+    - govet
+    - ineffassign
+    - misspell
+    - staticcheck
+    - unconvert
+    - unused
+    - usestdlibvars
+
+  settings:
+    cyclop:
+      max-complexity: 20
+      package-average: 10.0
+
+  exclusions:
+    rules:
+      - path: _test\.go$
+        linters:
+          - cyclop
+          - errcheck
+
+formatters:
+  enable:
+    - gci
+    - gofmt
+  settings:
+    gci:
+      custom-order: true
+      sections:
+        - standard
+        - default
+        - prefix(github.com/shahradelahi/wiresocks)
