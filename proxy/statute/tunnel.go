@@ -12,6 +12,8 @@ import (
 
 // isClosedConnError reports whether err is an error from use of a closed
 // network connection.
+//
+//nolint:unused
 func isClosedConnError(err error) bool {
 	if err == nil {
 		return false
@@ -36,6 +38,7 @@ func isClosedConnError(err error) bool {
 	return false
 }
 
+//nolint:unused
 func errno(v error) uintptr {
 	if rv := reflect.ValueOf(v); rv.Kind() == reflect.Uintptr {
 		return uintptr(rv.Uint())
@@ -67,8 +70,10 @@ func Tunnel(ctx context.Context, c1, c2 io.ReadWriteCloser, buf1, buf2 []byte) e
 	}
 }
 
+//nolint:unused
 type tunnelErr [5]error
 
+//nolint:unused
 func (t tunnelErr) FirstError() error {
 	for _, err := range t {
 		if err != nil {

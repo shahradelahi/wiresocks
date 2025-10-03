@@ -432,7 +432,7 @@ func (s *Server) handleAssociate(req *request) error {
 			if err != nil {
 				return fmt.Errorf("failed to write UDP packet to source %s for SOCKS5 UDP ASSOCIATE: %w", sourceAddr.String(), err)
 			}
-		} else {
+		} else { //nolint:staticcheck
 			// Ignoring UDP packet from unknown source
 		}
 	}
