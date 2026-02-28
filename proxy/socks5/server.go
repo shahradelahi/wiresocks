@@ -8,60 +8,47 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"sync"
 
+	"github.com/go-gost/gosocks5"
 	"github.com/shahradelahi/wiresocks/proxy/statute"
 )
 
-// Server is accepting connections and handling the details of the SOCKS5 protocol
+const (
+	defaultBindAddress = "127.0.0.1:1080"
+)
+
 type Server struct {
-	// bind is the address to listen on
-	Bind string
-
-	Listener net.Listener
-
-	// ProxyDial specifies the optional proxyDial function for
-	// establishing the transport connection.
-	ProxyDial statute.ProxyDialFunc
-	// ProxyListenPacket specifies the optional proxyListenPacket function for
-	// establishing the transport connection.
-	ProxyListenPacket statute.ProxyListenPacket
-	// PacketForwardAddress specifies the packet forwarding address
+	Bind                 string
+	Listener             net.Listener
+	ProxyDial            statute.ProxyDialFunc
+	ProxyListenPacket    statute.ProxyListenPacket
 	PacketForwardAddress statute.PacketForwardAddress
-	// Credentials provided for username/password authentication
-	Credentials statute.CredentialStore
-	// Resolver specifies the optional name resolver
-	Resolver statute.NameResolver
-	// Context is default context
-	Context context.Context
-	// BytesPool getting and returning temporary bytes for use by io.CopyBuffer
-	BytesPool statute.BytesPool
+	Credentials          statute.CredentialStore
+	Resolver             statute.NameResolver
+	Context              context.Context
+	BytesPool            statute.BytesPool
 }
 
 func NewServer(options ...ServerOption) *Server {
 	s := &Server{
-		Bind:                 defaultBindAddress,
-		ProxyDial:            statute.DefaultProxyDial(),
-		ProxyListenPacket:    statute.DefaultProxyListenPacket(),
-		PacketForwardAddress: defaultReplyPacketForwardAddress,
-		Context:              statute.DefaultContext(),
-		Credentials:          nil,
-		Resolver:             &statute.DefaultResolver{},
+		Bind:              defaultBindAddress,
+		ProxyDial:         statute.DefaultProxyDial(),
+		ProxyListenPacket: statute.DefaultProxyListenPacket(),
+		Context:           statute.DefaultContext(),
+		Resolver:          &statute.DefaultResolver{},
 	}
 
 	for _, option := range options {
 		option(s)
 	}
-
 	return s
 }
 
 func (s *Server) ListenAndServe() error {
-
-	// Create a cancelable context based on s.Context
 	ctx, cancel := context.WithCancel(s.Context)
-	defer cancel() // Ensure resources are cleaned up
+	defer cancel()
 
-	// Start to accept connections and serve them
 	for {
 		select {
 		case <-ctx.Done():
@@ -71,182 +58,103 @@ func (s *Server) ListenAndServe() error {
 			if err != nil {
 				return fmt.Errorf("failed to accept SOCKS5 connection: %w", err)
 			}
-			// Start a new goroutine to handle each connection
-			// This way, the server can handle multiple connections concurrently
 			go func() {
-				defer func() {
-					_ = conn.Close()
-				}()
+				defer conn.Close()
 				_ = s.ServeConn(conn)
 			}()
 		}
 	}
 }
 
+// Custom selector to bridge gosocks5 and statute.CredentialStore
+type authSelector struct {
+	creds statute.CredentialStore
+}
+
+func (s *authSelector) Methods() []uint8 {
+	return []uint8{gosocks5.MethodUserPass}
+}
+
+func (s *authSelector) Select(methods ...uint8) uint8 {
+	for _, m := range methods {
+		if m == gosocks5.MethodUserPass {
+			return gosocks5.MethodUserPass
+		}
+	}
+	return gosocks5.MethodNoAcceptable
+}
+
+func (s *authSelector) OnSelected(method uint8, conn net.Conn) (string, net.Conn, error) {
+	if method != gosocks5.MethodUserPass {
+		return "", nil, gosocks5.ErrBadMethod
+	}
+	req, err := gosocks5.ReadUserPassRequest(conn)
+	if err != nil {
+		return "", nil, err
+	}
+	if !s.creds.Valid(req.Username, req.Password) {
+		_ = gosocks5.NewUserPassResponse(gosocks5.UserPassVer, gosocks5.Failure).Write(conn)
+		return "", nil, gosocks5.ErrAuthFailure
+	}
+	_ = gosocks5.NewUserPassResponse(gosocks5.UserPassVer, gosocks5.Succeeded).Write(conn)
+	return req.Username, conn, nil
+}
+
+type noAuthSelector struct{}
+
+func (s *noAuthSelector) Methods() []uint8              { return []uint8{gosocks5.MethodNoAuth} }
+func (s *noAuthSelector) Select(methods ...uint8) uint8 { return gosocks5.MethodNoAuth }
+func (s *noAuthSelector) OnSelected(method uint8, conn net.Conn) (string, net.Conn, error) {
+	return "", conn, nil
+}
+
 func (s *Server) ServeConn(conn net.Conn) error {
-	clientAddr := conn.RemoteAddr()
-	version, err := readByte(conn)
-	if err != nil {
-		return fmt.Errorf("failed to read SOCKS version from %s: %w", clientAddr, err)
-	}
-	if version != socks5Version {
-		return fmt.Errorf("unsupported SOCKS version %d from %s, expected %d", version, clientAddr, socks5Version)
-	}
-
-	if err := s.authenticate(conn); err != nil {
-		return fmt.Errorf("SOCKS5 authentication failed for %s: %w", clientAddr, err)
-	}
-
-	return s.handleRequest(conn)
-}
-
-func (s *Server) authenticate(conn net.Conn) error {
-	methods, err := readBytes(conn)
-	if err != nil {
-		return fmt.Errorf("failed to read authentication methods from %s: %w", conn.RemoteAddr(), err)
-	}
-
-	// If credentials are provided, we require username/password auth
+	var selector gosocks5.Selector
 	if s.Credentials != nil {
-		if bytes.IndexByte(methods, byte(usernamePasswordAuth)) != -1 {
-			if _, err := conn.Write([]byte{socks5Version, byte(usernamePasswordAuth)}); err != nil {
-				return fmt.Errorf("failed to write Username/Password auth response to %s: %w", conn.RemoteAddr(), err)
-			}
-			return s.handleUsernamePasswordAuth(conn)
-		}
-	} else { // No credentials, so no-auth is fine
-		if bytes.IndexByte(methods, byte(noAuth)) != -1 {
-			_, err := conn.Write([]byte{socks5Version, byte(noAuth)})
-			if err != nil {
-				return err
-			}
-			return nil
-		}
+		selector = &authSelector{creds: s.Credentials}
+	} else {
+		selector = &noAuthSelector{}
 	}
 
-	// No acceptable methods
-	_, err = conn.Write([]byte{socks5Version, byte(noAcceptable)})
+	sconn := gosocks5.ServerConn(conn, selector)
+	req, err := gosocks5.ReadRequest(sconn)
 	if err != nil {
-		return fmt.Errorf("failed to write no acceptable methods response to %s: %w", conn.RemoteAddr(), err)
+		return err
 	}
-	return errNoSupportedAuth
+
+	switch req.Cmd {
+	case gosocks5.CmdConnect:
+		return s.handleConnect(sconn, req)
+	case gosocks5.CmdUdp:
+		return s.handleUDPAssociate(sconn, req)
+	default:
+		_ = gosocks5.NewReply(gosocks5.CmdUnsupported, nil).Write(sconn)
+		return fmt.Errorf("unsupported command: %d", req.Cmd)
+	}
 }
 
-func (s *Server) handleUsernamePasswordAuth(conn net.Conn) error {
-	version, err := readByte(conn)
-	if err != nil {
-		return fmt.Errorf("failed to read auth version from %s: %w", conn.RemoteAddr(), err)
-	}
-	if version != 1 {
-		return fmt.Errorf("unsupported auth version %d from %s", version, conn.RemoteAddr())
-	}
+func (s *Server) handleConnect(conn net.Conn, req *gosocks5.Request) error {
+	targetAddr := req.Addr.String()
 
-	username, err := readBytes(conn)
-	if err != nil {
-		return fmt.Errorf("failed to read username from %s: %w", conn.RemoteAddr(), err)
-	}
-
-	password, err := readBytes(conn)
-	if err != nil {
-		return fmt.Errorf("failed to read password from %s: %w", conn.RemoteAddr(), err)
-	}
-
-	if !s.Credentials.Valid(string(username), string(password)) {
-		_, err := conn.Write([]byte{userAuthVersion, authFailure}) // failure
+	if s.Resolver != nil && req.Addr.Type == gosocks5.AddrDomain {
+		_, resolvedIP, err := s.Resolver.Resolve(s.Context, req.Addr.Host)
 		if err != nil {
+			_ = gosocks5.NewReply(gosocks5.HostUnreachable, nil).Write(conn)
 			return err
 		}
-		return errUserAuthFailed
-	}
-
-	_, err = conn.Write([]byte{userAuthVersion, authSuccess}) // success
-	if err != nil {
-		return fmt.Errorf("failed to write auth failure response to %s: %w", conn.RemoteAddr(), err)
-	}
-
-	return nil
-}
-
-func (s *Server) handleRequest(conn net.Conn) error {
-	req := &request{
-		Version: socks5Version,
-		Conn:    conn,
-	}
-
-	var header [3]byte
-	_, err := io.ReadFull(conn, header[:])
-	if err != nil {
-		return fmt.Errorf("failed to read request header from %s: %w", conn.RemoteAddr(), err)
-	}
-
-	if header[0] != socks5Version {
-		return fmt.Errorf("unsupported SOCKS5 command version %d from %s, expected %d", header[0], conn.RemoteAddr(), socks5Version)
-	}
-
-	req.Command = Command(header[1])
-
-	dest, err := readAddr(conn)
-	if err != nil {
-		if errors.Is(err, errUnrecognizedAddrType) {
-			_ = sendReply(conn, addrTypeNotSupported, nil)
-			return fmt.Errorf("unrecognized address type from %s: %w", conn.RemoteAddr(), err)
-		}
-		return fmt.Errorf("failed to read destination address from %s: %w", conn.RemoteAddr(), err)
-	}
-	req.DestinationAddr = dest
-	err = s.handle(req)
-	if err != nil {
-		return fmt.Errorf("error handling SOCKS5 request from %s: %w", conn.RemoteAddr(), err)
-	}
-
-	return nil
-}
-
-func (s *Server) handle(req *request) error {
-	switch req.Command {
-	case ConnectCommand:
-		return s.handleConnect(req)
-	case BindCommand:
-		return s.handleBind(req)
-	case AssociateCommand:
-		return s.handleAssociate(req)
-	default:
-		if err := sendReply(req.Conn, commandNotSupported, nil); err != nil {
-			return fmt.Errorf("failed to send commandNotSupported reply to %s: %w", req.Conn.RemoteAddr(), err)
-		}
-		return fmt.Errorf("unsupported SOCKS5 command: %v from %s", req.Command, req.Conn.RemoteAddr())
-	}
-}
-
-func (s *Server) handleConnect(req *request) error {
-	targetAddr := req.DestinationAddr.Address()
-
-	if s.Resolver != nil && req.DestinationAddr.Name != "" {
-		_, resolvedIP, err := s.Resolver.Resolve(s.Context, req.DestinationAddr.Name)
-		if err != nil {
-			_ = sendReply(req.Conn, errToReply(err), nil)
-			return fmt.Errorf("failed to resolve destination %s: %w", req.DestinationAddr.Name, err)
-		}
-		targetAddr = net.JoinHostPort(resolvedIP.String(), strconv.Itoa(req.DestinationAddr.Port))
+		targetAddr = net.JoinHostPort(resolvedIP.String(), strconv.Itoa(int(req.Addr.Port)))
 	}
 
 	target, err := s.ProxyDial(s.Context, "tcp", targetAddr)
 	if err != nil {
-		_ = sendReply(req.Conn, errToReply(err), nil)
-		return fmt.Errorf("failed to dial target %s for SOCKS5 CONNECT from %s: %w", targetAddr, req.Conn.RemoteAddr(), err)
+		_ = gosocks5.NewReply(gosocks5.NetUnreachable, nil).Write(conn)
+		return err
 	}
-	defer func() {
-		_ = target.Close()
-	}()
+	defer target.Close()
 
-	localAddr := target.LocalAddr()
-	local, ok := localAddr.(*net.TCPAddr)
-	if !ok {
-		return fmt.Errorf("failed to get local TCP address for %s: %s://%s", req.Conn.RemoteAddr(), localAddr.Network(), localAddr.String())
-	}
-	bind := address{IP: local.IP, Port: local.Port}
-	if err := sendReply(req.Conn, successReply, &bind); err != nil {
-		return fmt.Errorf("failed to send SOCKS5 success reply to %s: %w", req.Conn.RemoteAddr(), err)
+	reply := gosocks5.NewReply(gosocks5.Succeeded, toSocksAddr(target.LocalAddr()))
+	if err := reply.Write(conn); err != nil {
+		return err
 	}
 
 	var buf1, buf2 []byte
@@ -261,215 +169,162 @@ func (s *Server) handleConnect(req *request) error {
 		buf1 = make([]byte, 32*1024)
 		buf2 = make([]byte, 32*1024)
 	}
-	return statute.Tunnel(s.Context, target, req.Conn, buf1, buf2)
+
+	return statute.Tunnel(s.Context, target, conn, buf1, buf2)
 }
 
-func (s *Server) handleBind(req *request) error {
+func (s *Server) handleUDPAssociate(tcpConn net.Conn, req *gosocks5.Request) error {
+	tcpLocalAddr, ok := tcpConn.LocalAddr().(*net.TCPAddr)
+	if !ok {
+		_ = gosocks5.NewReply(gosocks5.Failure, nil).Write(tcpConn)
+		return errors.New("not a TCP connection")
+	}
+
+	// 1. Bind local UDP for the client to send packets to
+	localUDPAddr := &net.UDPAddr{IP: tcpLocalAddr.IP, Port: 0}
+	clientSideUDP, err := net.ListenUDP("udp", localUDPAddr)
+	if err != nil {
+		_ = gosocks5.NewReply(gosocks5.Failure, nil).Write(tcpConn)
+		return err
+	}
+	defer clientSideUDP.Close()
+
+	// 2. Create UDP connection via WireGuard netstack BEFORE replying Succeeded.
+	// This ensures that if the WireGuard tunnel isn't fully ready, we fail gracefully.
+	wgSideUDP, err := s.ProxyListenPacket(s.Context, "udp", "")
+	if err != nil {
+		_ = gosocks5.NewReply(gosocks5.Failure, nil).Write(tcpConn)
+		return err
+	}
+	defer wgSideUDP.Close()
+
+	// 3. Reply to client with the successfully bound address
+	replyAddr := clientSideUDP.LocalAddr().(*net.UDPAddr)
+	if replyAddr.IP.IsUnspecified() {
+		// Fallback to the IP the TCP connection was established on
+		replyAddr.IP = tcpLocalAddr.IP
+	}
+
+	reply := gosocks5.NewReply(gosocks5.Succeeded, toSocksAddr(replyAddr))
+	if err := reply.Write(tcpConn); err != nil {
+		return err
+	}
+
+	// 4. Setup state and synchronization
 	ctx, cancel := context.WithCancel(s.Context)
 	defer cancel()
 
-	// Create a listener
-	listenIP := req.Conn.LocalAddr().(*net.TCPAddr).IP
-	listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: listenIP})
-	if err != nil {
-		_ = sendReply(req.Conn, serverFailure, nil)
-		return fmt.Errorf("failed to listen for SOCKS5 BIND for %s: %w", req.Conn.RemoteAddr(), err)
-	}
-	defer func() {
-		_ = listener.Close()
+	var clientAddr net.Addr
+	var clientAddrMutex sync.RWMutex
+
+	// If TCP connection closes, kill the UDP association (SOCKS5 Spec requirement)
+	go func() {
+		defer cancel()
+		// Discard reads until EOF to keep connection open without blocking memory
+		_, _ = io.Copy(io.Discard, tcpConn)
 	}()
 
-	// Send first reply
-	listenAddr := listener.Addr().(*net.TCPAddr)
-	bindAddr := address{IP: listenAddr.IP, Port: listenAddr.Port}
-	if err := sendReply(req.Conn, successReply, &bindAddr); err != nil {
-		return fmt.Errorf("failed to send first SOCKS5 reply to %s: %w", req.Conn.RemoteAddr(), err)
-	}
+	errCh := make(chan error, 2)
 
-	// Wait for incoming connection
-	var remoteConn net.Conn
-	acceptChan := make(chan error, 1)
+	// Upstream: Client -> WG
 	go func() {
-		var err error
-		remoteConn, err = listener.Accept()
-		acceptChan <- err
+		buf := make([]byte, 65535)
+		for {
+			n, cAddr, err := clientSideUDP.ReadFrom(buf)
+			if err != nil {
+				errCh <- err
+				return
+			}
+
+			// Store the client's address so we know where to send returning packets
+			clientAddrMutex.Lock()
+			if clientAddr == nil {
+				clientAddr = cAddr
+			}
+			clientAddrMutex.Unlock()
+
+			// Parse SOCKS5 UDP encapsulation
+			d := &gosocks5.UDPDatagram{}
+			if _, err := d.ReadFrom(bytes.NewReader(buf[:n])); err != nil {
+				continue
+			}
+			if d.Header.Frag != 0 {
+				continue // fragments not supported yet
+			}
+
+			targetHost := d.Header.Addr.String()
+			if s.Resolver != nil && d.Header.Addr.Type == gosocks5.AddrDomain {
+				_, resolvedIP, err := s.Resolver.Resolve(ctx, d.Header.Addr.Host)
+				if err == nil {
+					targetHost = net.JoinHostPort(resolvedIP.String(), strconv.Itoa(int(d.Header.Addr.Port)))
+				}
+			}
+
+			targetUDPAddr, err := net.ResolveUDPAddr("udp", targetHost)
+			if err != nil {
+				continue
+			}
+
+			// Send raw payload into WireGuard
+			_, _ = wgSideUDP.WriteTo(d.Data, targetUDPAddr)
+		}
+	}()
+
+	// Downstream: WG -> Client
+	go func() {
+		buf := make([]byte, 65535)
+		for {
+			n, srcAddr, err := wgSideUDP.ReadFrom(buf)
+			if err != nil {
+				errCh <- err
+				return
+			}
+
+			clientAddrMutex.RLock()
+			cAddr := clientAddr
+			clientAddrMutex.RUnlock()
+
+			if cAddr == nil {
+				continue // Nowhere to send yet
+			}
+
+			// Re-encapsulate the payload in a SOCKS5 UDP wrapper
+			hdr := gosocks5.NewUDPHeader(0, 0, toSocksAddr(srcAddr))
+			d := gosocks5.NewUDPDatagram(hdr, buf[:n])
+
+			var out bytes.Buffer
+			_, _ = d.WriteTo(&out)
+			_, _ = clientSideUDP.WriteTo(out.Bytes(), cAddr)
+		}
 	}()
 
 	select {
-	case err := <-acceptChan:
-		if err != nil {
-			_ = sendReply(req.Conn, serverFailure, nil)
-			return fmt.Errorf("failed to accept incoming connection for SOCKS5 BIND for %s: %w", req.Conn.RemoteAddr(), err)
-		}
 	case <-ctx.Done():
-		_ = sendReply(req.Conn, serverFailure, nil)
-		return fmt.Errorf("SOCKS5 BIND accept timeout for %s: %w", req.Conn.RemoteAddr(), ctx.Err())
+		return nil
+	case err := <-errCh:
+		return err
 	}
-	defer func() {
-		_ = remoteConn.Close()
-	}()
+}
 
-	remoteTCPAddr := remoteConn.RemoteAddr().(*net.TCPAddr)
-	if req.DestinationAddr.IP != nil && !req.DestinationAddr.IP.IsUnspecified() {
-		if !remoteTCPAddr.IP.Equal(req.DestinationAddr.IP) {
-			_ = sendReply(req.Conn, ruleFailure, nil)
-			return fmt.Errorf("SOCKS5 BIND address mismatch for %s: got %s, want %s", req.Conn.RemoteAddr(), remoteTCPAddr.IP, req.DestinationAddr.IP)
+func toSocksAddr(addr net.Addr) *gosocks5.Addr {
+	host, portStr, _ := net.SplitHostPort(addr.String())
+	port, _ := strconv.Atoi(portStr)
+
+	a := &gosocks5.Addr{
+		Host: host,
+		Port: uint16(port),
+	}
+
+	// Ensure the correct Type is set
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.To4() != nil {
+			a.Type = gosocks5.AddrIPv4
+		} else {
+			a.Type = gosocks5.AddrIPv6
 		}
-	}
-
-	// Send second reply
-	remoteAddr := address{IP: remoteTCPAddr.IP, Port: remoteTCPAddr.Port}
-	if err := sendReply(req.Conn, successReply, &remoteAddr); err != nil {
-		return fmt.Errorf("failed to send second SOCKS5 reply to %s: %w", req.Conn.RemoteAddr(), err)
-	}
-
-	// Tunnel data
-	var buf1, buf2 []byte
-	if s.BytesPool != nil {
-		buf1 = s.BytesPool.Get()
-		buf2 = s.BytesPool.Get()
-		defer func() {
-			s.BytesPool.Put(buf1)
-			s.BytesPool.Put(buf2)
-		}()
 	} else {
-		buf1 = make([]byte, 32*1024)
-		buf2 = make([]byte, 32*1024)
-	}
-	return statute.Tunnel(s.Context, remoteConn, req.Conn, buf1, buf2)
-}
-
-func (s *Server) handleAssociate(req *request) error {
-	destinationAddr := req.DestinationAddr.String()
-	udpConn, err := s.ProxyListenPacket(s.Context, "udp", destinationAddr)
-	if err != nil {
-		_ = sendReply(req.Conn, errToReply(err), nil)
-		return fmt.Errorf("failed to listen for SOCKS5 UDP ASSOCIATE on %s for %s: %w", destinationAddr, req.Conn.RemoteAddr(), err)
+		a.Type = gosocks5.AddrDomain
 	}
 
-	ip, port, err := s.PacketForwardAddress(s.Context, destinationAddr, udpConn, req.Conn)
-	if err != nil {
-		return fmt.Errorf("failed to get packet forward address for %s: %w", req.Conn.RemoteAddr(), err)
-	}
-	bind := address{IP: ip, Port: port}
-	if err := sendReply(req.Conn, successReply, &bind); err != nil {
-		return fmt.Errorf("failed to send SOCKS5 success reply to %s: %w", req.Conn.RemoteAddr(), err)
-	}
-
-	defer func() {
-		_ = udpConn.Close()
-	}()
-
-	go func() {
-		var buf [1]byte
-		for {
-			_, err := req.Conn.Read(buf[:])
-			if err != nil {
-				_ = udpConn.Close()
-				break
-			}
-		}
-	}()
-
-	var (
-		sourceAddr  net.Addr
-		wantSource  string
-		targetAddr  net.Addr
-		wantTarget  string
-		replyPrefix []byte
-		buf         [maxUdpPacket]byte
-	)
-
-	for {
-		n, addr, err := udpConn.ReadFrom(buf[:])
-		if err != nil {
-			return fmt.Errorf("error reading from UDP connection for SOCKS5 UDP ASSOCIATE for %s: %w", req.Conn.RemoteAddr(), err)
-		}
-
-		if sourceAddr == nil {
-			sourceAddr = addr
-			wantSource = sourceAddr.String()
-		}
-
-		gotAddr := addr.String()
-		if wantSource == gotAddr {
-			// Packet from client to target
-			if n < 3 {
-				continue
-			}
-			reader := bytes.NewBuffer(buf[3:n])
-			addr, err := readAddr(reader)
-			if err != nil {
-				continue
-			}
-			if targetAddr == nil {
-				targetAddr = &net.UDPAddr{
-					IP:   addr.IP,
-					Port: addr.Port,
-				}
-				wantTarget = targetAddr.String()
-			}
-			if addr.String() != wantTarget {
-				continue
-			}
-			_, err = udpConn.WriteTo(reader.Bytes(), targetAddr)
-			if err != nil {
-				return fmt.Errorf("failed to write UDP packet to target %s for SOCKS5 UDP ASSOCIATE: %w", targetAddr.String(), err)
-			}
-		} else if targetAddr != nil && wantTarget == gotAddr {
-			// Packet from target to client
-			if replyPrefix == nil {
-				b := bytes.NewBuffer(make([]byte, 3, 16))
-				err = writeAddrWithStr(b, wantTarget)
-				if err != nil {
-					return fmt.Errorf("failed to create reply prefix for SOCKS5 UDP ASSOCIATE: %w", err)
-				}
-				replyPrefix = b.Bytes()
-			}
-			copy(buf[len(replyPrefix):len(replyPrefix)+n], buf[:n])
-			copy(buf[:len(replyPrefix)], replyPrefix)
-			_, err = udpConn.WriteTo(buf[:len(replyPrefix)+n], sourceAddr)
-			if err != nil {
-				return fmt.Errorf("failed to write UDP packet to source %s for SOCKS5 UDP ASSOCIATE: %w", sourceAddr.String(), err)
-			}
-		} else { //nolint:staticcheck
-			// Ignoring UDP packet from unknown source
-		}
-	}
-}
-
-func sendReply(w io.Writer, resp reply, addr *address) error {
-	_, err := w.Write([]byte{socks5Version, byte(resp), 0})
-	if err != nil {
-		return fmt.Errorf("failed to write SOCKS5 reply header: %w", err)
-	}
-	err = writeAddr(w, addr)
-	if err != nil {
-		return fmt.Errorf("failed to write SOCKS5 reply address %s: %w", addr.String(), err)
-	}
-	return err
-}
-
-type request struct {
-	Version         uint8
-	Command         Command
-	DestinationAddr *address
-	Username        string
-	Password        string
-	Conn            net.Conn
-}
-
-func defaultReplyPacketForwardAddress(_ context.Context, destinationAddr string, packet net.PacketConn, conn net.Conn) (net.IP, int, error) {
-	udpLocal := packet.LocalAddr()
-	udpLocalAddr, ok := udpLocal.(*net.UDPAddr)
-	if !ok {
-		return nil, 0, fmt.Errorf("failed to get local UDP address for destination %s: %s://%s", destinationAddr, udpLocal.Network(), udpLocal.String())
-	}
-
-	tcpLocal := conn.LocalAddr()
-	tcpLocalAddr, ok := tcpLocal.(*net.TCPAddr)
-	if !ok {
-		return nil, 0, fmt.Errorf("failed to get local TCP address for destination %s: %s://%s", destinationAddr, tcpLocal.Network(), tcpLocal.String())
-	}
-	return tcpLocalAddr.IP, udpLocalAddr.Port, nil
+	return a
 }

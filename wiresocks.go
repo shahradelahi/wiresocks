@@ -175,6 +175,16 @@ func (s *WireSocks) startSocksProxy() error {
 		socks5.WithListener(s.socksLn),
 		socks5.WithContext(s.ctx),
 		socks5.WithProxyDial(s.vt.Tnet.DialContext),
+		socks5.WithProxyListenPacket(func(ctx context.Context, network, address string) (net.PacketConn, error) {
+			var addr *net.UDPAddr
+			if address != "" {
+				addr, _ = net.ResolveUDPAddr(network, address)
+			}
+			if addr == nil {
+				addr = &net.UDPAddr{Port: 0}
+			}
+			return s.vt.Tnet.ListenUDP(addr)
+		}),
 		socks5.WithResolver(s.vt),
 	}
 

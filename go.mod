@@ -6,6 +6,7 @@ toolchain go1.24.6
 
 require (
 	github.com/amnezia-vpn/amneziawg-go v0.2.13
+	github.com/go-gost/gosocks5 v0.4.2
 	github.com/go-ini/ini v1.67.0
 	github.com/spf13/cobra v1.9.1
 )
