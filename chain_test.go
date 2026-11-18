@@ -441,6 +441,23 @@ func TestTwoHopWireguardChainE2E(t *testing.T) {
 	}()
 	defer srv.Close()
 
+	// Start a UDP echo server INSIDE Server 2's netstack at 10.20.0.1:9090
+	udpConn, err := s2Tnet.ListenUDPAddrPort(netip.MustParseAddrPort("10.20.0.1:9090"))
+	if err != nil {
+		t.Fatalf("failed to listen UDP inside Server 2 netstack: %v", err)
+	}
+	defer udpConn.Close()
+	go func() {
+		buf := make([]byte, 1024)
+		for {
+			n, raddr, err := udpConn.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			_, _ = udpConn.WriteTo(buf[:n], raddr)
+		}
+	}()
+
 	// Configure Hop 1 -> Server 1 on 127.0.0.1:s1Port, DNS = 10.10.0.1
 	hop1 := &Configuration{
 		Interface: &InterfaceConfig{
@@ -549,6 +566,91 @@ func TestTwoHopWireguardChainE2E(t *testing.T) {
 	}
 	if !strings.Contains(string(socksResp), "hello from hop 2 exit") {
 		t.Fatalf("unexpected SOCKS5 response:\n%s", string(socksResp))
+	}
+
+	// 3. Test SOCKS5 UDP ASSOCIATE through the 2-hop chain
+	socksTCPConn, err := net.DialTimeout("tcp", socksAddr.String(), 5*time.Second)
+	if err != nil {
+		t.Fatalf("SOCKS5 TCP dial for UDP ASSOCIATE failed: %v", err)
+	}
+	defer socksTCPConn.Close()
+
+	if _, err := socksTCPConn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		t.Fatalf("SOCKS5 greeting failed: %v", err)
+	}
+	var mResp [2]byte
+	if _, err := io.ReadFull(socksTCPConn, mResp[:]); err != nil || mResp[0] != 0x05 || mResp[1] != 0x00 {
+		t.Fatalf("SOCKS5 auth failed: %v", err)
+	}
+
+	// Request CmdUDP (0x03)
+	if _, err := socksTCPConn.Write([]byte{0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
+		t.Fatalf("SOCKS5 UDP ASSOCIATE request failed: %v", err)
+	}
+
+	var assocHdr [4]byte
+	if _, err := io.ReadFull(socksTCPConn, assocHdr[:]); err != nil || assocHdr[1] != 0x00 {
+		t.Fatalf("SOCKS5 UDP ASSOCIATE failed with header: %v, err: %v", assocHdr, err)
+	}
+
+	var relayIP net.IP
+	var relayPort uint16
+	switch assocHdr[3] {
+	case 0x01: // IPv4
+		var buf [6]byte
+		if _, err := io.ReadFull(socksTCPConn, buf[:]); err != nil {
+			t.Fatalf("failed to read SOCKS5 relay IPv4: %v", err)
+		}
+		relayIP = net.IP(buf[:4])
+		relayPort = binary.BigEndian.Uint16(buf[4:6])
+	case 0x04: // IPv6
+		var buf [18]byte
+		if _, err := io.ReadFull(socksTCPConn, buf[:]); err != nil {
+			t.Fatalf("failed to read SOCKS5 relay IPv6: %v", err)
+		}
+		relayIP = net.IP(buf[:16])
+		relayPort = binary.BigEndian.Uint16(buf[16:18])
+	default:
+		t.Fatalf("unsupported ATYP in UDP ASSOCIATE response: %d", assocHdr[3])
+	}
+
+	if relayIP.IsUnspecified() {
+		relayIP = net.ParseIP("127.0.0.1")
+	}
+
+	clientUDP, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: relayIP, Port: int(relayPort)})
+	if err != nil {
+		t.Fatalf("failed to dial SOCKS5 UDP relay: %v", err)
+	}
+	defer clientUDP.Close()
+
+	// Build SOCKS5 UDP header for 10.20.0.1:9090
+	// RSV(2) | FRAG(1) | ATYP(1) | DST.ADDR(4) | DST.PORT(2) | Payload
+	udpPayload := []byte("ping udp echo")
+	reqBuf := make([]byte, 0, 10+len(udpPayload))
+	reqBuf = append(reqBuf, 0x00, 0x00, 0x00, 0x01)
+	reqBuf = append(reqBuf, net.ParseIP("10.20.0.1").To4()...)
+	var pBuf [2]byte
+	binary.BigEndian.PutUint16(pBuf[:], 9090)
+	reqBuf = append(reqBuf, pBuf[:]...)
+	reqBuf = append(reqBuf, udpPayload...)
+
+	_ = clientUDP.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := clientUDP.Write(reqBuf); err != nil {
+		t.Fatalf("failed to write UDP packet to relay: %v", err)
+	}
+
+	recvBuf := make([]byte, 1024)
+	n, err := clientUDP.Read(recvBuf)
+	if err != nil {
+		t.Fatalf("failed to read UDP packet from relay: %v", err)
+	}
+
+	if n < 10 {
+		t.Fatalf("UDP relay response too short: %d bytes", n)
+	}
+	if string(recvBuf[10:n]) != "ping udp echo" {
+		t.Fatalf("unexpected UDP echo response: %q", string(recvBuf[10:n]))
 	}
 
 	// Verify graceful shutdown

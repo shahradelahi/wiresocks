@@ -218,6 +218,20 @@ func (s *WireSocks) closeListeners() {
 	}
 }
 
+func selectUDPBindAddr(addrs []netip.Addr) netip.Addr {
+	for _, addr := range addrs {
+		if unmapped := addr.Unmap(); unmapped.Is4() {
+			return unmapped
+		}
+	}
+	for _, addr := range addrs {
+		if unmapped := addr.Unmap(); unmapped.Is6() {
+			return unmapped
+		}
+	}
+	return netip.IPv4Unspecified()
+}
+
 func (s *WireSocks) startSocksProxy(vt *VirtualTun) error {
 	ln, err := net.Listen("tcp", s.socksBindAddress.String())
 	if err != nil {
@@ -234,14 +248,18 @@ func (s *WireSocks) startSocksProxy(vt *VirtualTun) error {
 		socks5.WithContext(s.ctx),
 		socks5.WithProxyDial(vt.Tnet.DialContext),
 		socks5.WithProxyListenPacket(func(ctx context.Context, network, address string) (net.PacketConn, error) {
-			var addr *net.UDPAddr
+			var ap netip.AddrPort
 			if address != "" {
-				addr, _ = net.ResolveUDPAddr(network, address)
+				if parsed, err := netip.ParseAddrPort(address); err == nil {
+					ap = parsed
+				} else if udpAddr, err := net.ResolveUDPAddr(network, address); err == nil && udpAddr != nil {
+					ap = udpAddr.AddrPort()
+				}
 			}
-			if addr == nil {
-				addr = &net.UDPAddr{Port: 0}
+			if !ap.Addr().IsValid() || ap.Addr().IsUnspecified() {
+				ap = netip.AddrPortFrom(selectUDPBindAddr(vt.localAddrs), ap.Port())
 			}
-			return vt.Tnet.ListenUDP(addr)
+			return vt.Tnet.ListenUDPAddrPort(ap)
 		}),
 		socks5.WithResolver(vt),
 	}
