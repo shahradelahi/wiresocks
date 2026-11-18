@@ -11,6 +11,7 @@ import (
 	"sync"
 
 	"github.com/go-gost/gosocks5"
+
 	"github.com/shahradelahi/wiresocks/proxy/statute"
 )
 

@@ -10,15 +10,16 @@ import (
 	"net/netip"
 	"time"
 
-	"github.com/amnezia-vpn/amneziawg-go/device"
-	"github.com/amnezia-vpn/amneziawg-go/tun/netstack"
+	"github.com/amnezia-vpn/amneziawg-go/v3/device"
+	"github.com/amnezia-vpn/amneziawg-go/v3/tun/netstack"
 )
 
 // VirtualTun stores a reference to netstack network
 type VirtualTun struct {
-	Tnet *netstack.Net
-	Dev  *device.Device
-	ctx  context.Context
+	Tnet       *netstack.Net
+	Dev        *device.Device
+	ctx        context.Context
+	localAddrs []netip.Addr
 }
 
 // Resolve resolves a hostname and returns an IP.

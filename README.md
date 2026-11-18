@@ -43,6 +43,7 @@ Many WireGuard clients require kernel-level access or route all system traffic t
 ## ✨ Features
 
 - **User-Space WireGuard:** Connects to a WireGuard peer without needing kernel modules or root access.
+- **Multi-Hop Tunnel Chaining:** Chain multiple WireGuard/AmneziaWG configurations sequentially in user-space without modifying host routing tables.
 - **SOCKS and HTTP Proxy:** Exposes both SOCKS and HTTP proxies to tunnel application traffic, with optional authentication.
 - **Full SOCKS Support:** Implements SOCKS5 with TCP (`CONNECT`) and UDP (`ASSOCIATE`) support.
 - **Standard Configuration:** Uses a standard `wg-quick`-style configuration file.
@@ -87,7 +88,7 @@ Run `wiresocks` from the command line, providing the path to your WireGuard conf
 
 ### Command-line Flags
 
-- `-c`, `--config <path>`: Path to the WireGuard configuration file (default: `./config.conf`).
+- `-c`, `--config <path>`: Path to the WireGuard configuration file(s). Repeat to chain tunnels in order from entry to exit (default: `./config.conf`).
 - `--socks-addr <addr:port>`: SOCKS5 proxy bind address.
 - `--http-addr <addr:port>`: HTTP proxy bind address.
 - `-p`, `--password <password>`: Proxy password for authentication (optional).
@@ -99,6 +100,12 @@ Run `wiresocks` from the command line, providing the path to your WireGuard conf
 
 ```bash
 ./build/wiresocks -c /etc/wireguard/wg0.conf --socks-addr 127.0.0.1:1080 --http-addr 127.0.0.1:8118
+```
+
+**Multi-Hop Example:** Chain traffic through `entry.conf` and then `exit.conf`.
+
+```bash
+./build/wiresocks -c ./entry.conf -c ./exit.conf --socks-addr 127.0.0.1:1080
 ```
 
 ## 📚 Usage as a Library
@@ -163,7 +170,7 @@ func main() {
 		Password:      "mypassword",
 	}
 
-	// Create a new WireSocks instance
+	// Create a new WireSocks instance (use WithWireguardChain or AddWireguardHop for multi-hop chains)
 	ws, err := wiresocks.NewWireSocks(
 		wiresocks.WithContext(context.Background()),
 		wiresocks.WithWireguardConfig(&wiresocks.Configuration{

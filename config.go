@@ -23,6 +23,21 @@ type InterfaceConfig struct {
 	DNS        []netip.Addr
 	MTU        int
 	FwMark     uint32
+	Jc         *int
+	Jmin       *int
+	Jmax       *int
+	S1         *int
+	S2         *int
+	H1         *int
+	H2         *int
+	H3         *int
+	H4         *int
+}
+
+func (i *InterfaceConfig) HasAmneziaWGParams() bool {
+	return i.Jc != nil || i.Jmin != nil || i.Jmax != nil ||
+		i.S1 != nil || i.S2 != nil ||
+		i.H1 != nil || i.H2 != nil || i.H3 != nil || i.H4 != nil
 }
 
 type Configuration struct {
@@ -40,60 +55,132 @@ func (c *Configuration) String() (string, error) {
 		if err != nil {
 			return "", err
 		}
-		b.WriteString(fmt.Sprintf("PrivateKey = %s\n", privKeyB64))
+		fmt.Fprintf(&b, "PrivateKey = %s\n", privKeyB64)
 	}
 	if len(c.Interface.Addresses) > 0 {
 		var addrs []string
 		for _, addr := range c.Interface.Addresses {
 			addrs = append(addrs, addr.String())
 		}
-		b.WriteString(fmt.Sprintf("Address = %s\n", strings.Join(addrs, ", ")))
+		fmt.Fprintf(&b, "Address = %s\n", strings.Join(addrs, ", "))
 	}
 	if len(c.Interface.DNS) > 0 {
 		var dns []string
 		for _, d := range c.Interface.DNS {
 			dns = append(dns, d.String())
 		}
-		b.WriteString(fmt.Sprintf("DNS = %s\n", strings.Join(dns, ", ")))
+		fmt.Fprintf(&b, "DNS = %s\n", strings.Join(dns, ", "))
 	}
 	if c.Interface.MTU != 0 {
-		b.WriteString(fmt.Sprintf("MTU = %d\n", c.Interface.MTU))
+		fmt.Fprintf(&b, "MTU = %d\n", c.Interface.MTU)
 	}
+	writeOptionalInt := func(name string, val *int) {
+		if val != nil {
+			fmt.Fprintf(&b, "%s = %d\n", name, *val)
+		}
+	}
+	writeOptionalInt("Jc", c.Interface.Jc)
+	writeOptionalInt("Jmin", c.Interface.Jmin)
+	writeOptionalInt("Jmax", c.Interface.Jmax)
+	writeOptionalInt("S1", c.Interface.S1)
+	writeOptionalInt("S2", c.Interface.S2)
+	writeOptionalInt("H1", c.Interface.H1)
+	writeOptionalInt("H2", c.Interface.H2)
+	writeOptionalInt("H3", c.Interface.H3)
+	writeOptionalInt("H4", c.Interface.H4)
 
 	// [Peer] sections
 	for _, peer := range c.Peers {
 		b.WriteString("\n[Peer]\n")
 		if peer.PublicKey != "" {
-
 			pubKeyB64, err := EncodeHexToBase64(peer.PublicKey)
 			if err != nil {
 				return "", err
 			}
-			b.WriteString(fmt.Sprintf("PublicKey = %s\n", pubKeyB64))
+			fmt.Fprintf(&b, "PublicKey = %s\n", pubKeyB64)
 		}
 		if peer.PreSharedKey != "" && peer.PreSharedKey != "0000000000000000000000000000000000000000000000000000000000000000" {
 			pskB64, err := EncodeHexToBase64(peer.PreSharedKey)
 			if err != nil {
 				return "", err
 			}
-			b.WriteString(fmt.Sprintf("PresharedKey = %s\n", pskB64))
+			fmt.Fprintf(&b, "PresharedKey = %s\n", pskB64)
 		}
 		if len(peer.AllowedIPs) > 0 {
 			var ips []string
 			for _, ip := range peer.AllowedIPs {
 				ips = append(ips, ip.String())
 			}
-			b.WriteString(fmt.Sprintf("AllowedIPs = %s\n", strings.Join(ips, ", ")))
+			fmt.Fprintf(&b, "AllowedIPs = %s\n", strings.Join(ips, ", "))
 		}
 		if peer.Endpoint != "" {
-			b.WriteString(fmt.Sprintf("Endpoint = %s\n", peer.Endpoint))
+			fmt.Fprintf(&b, "Endpoint = %s\n", peer.Endpoint)
 		}
 		if peer.KeepAlive != 0 {
-			b.WriteString(fmt.Sprintf("PersistentKeepalive = %d\n", peer.KeepAlive))
+			fmt.Fprintf(&b, "PersistentKeepalive = %d\n", peer.KeepAlive)
 		}
 	}
 
 	return b.String(), nil
+}
+
+func parseOptionalInt(section *ini.Section, keyName string) (*int, error) {
+	sectionKey, err := section.GetKey(keyName)
+	if err != nil {
+		return nil, nil
+	}
+	value, err := sectionKey.Int()
+	if err != nil {
+		return nil, fmt.Errorf("invalid %s value: %w", keyName, err)
+	}
+	return &value, nil
+}
+
+func parseInterfaceAddresses(iface *ini.Section) ([]netip.Prefix, error) {
+	key, err := iface.GetKey("Address")
+	if err != nil {
+		return nil, nil
+	}
+
+	var addresses []netip.Prefix
+	for _, str := range key.StringsWithShadows(",") {
+		str = strings.TrimSpace(str)
+		if str == "" {
+			continue
+		}
+		prefix, err := ParsePrefixOrAddr(str)
+		if err != nil {
+			return nil, fmt.Errorf("address %q is not a valid IP address or CIDR prefix: %w", str, err)
+		}
+		addresses = append(addresses, prefix)
+	}
+	return addresses, nil
+}
+
+func parseInterfaceObfuscation(iface *ini.Section, device *InterfaceConfig) error {
+	fields := []struct {
+		name string
+		dst  **int
+	}{
+		{"Jc", &device.Jc},
+		{"Jmin", &device.Jmin},
+		{"Jmax", &device.Jmax},
+		{"S1", &device.S1},
+		{"S2", &device.S2},
+		{"H1", &device.H1},
+		{"H2", &device.H2},
+		{"H3", &device.H3},
+		{"H4", &device.H4},
+	}
+
+	for _, f := range fields {
+		val, err := parseOptionalInt(iface, f.name)
+		if err != nil {
+			return err
+		}
+		*f.dst = val
+	}
+	return nil
 }
 
 // ParseInterface parses the [Interface] section
@@ -105,31 +192,13 @@ func ParseInterface(cfg *ini.File) (InterfaceConfig, error) {
 	}
 	iface := interfaces[0]
 
-	key := iface.Key("Address")
-	if key == nil {
-		return InterfaceConfig{}, nil
-	}
-
-	var addresses []netip.Prefix
-	for _, str := range key.StringsWithShadows(",") {
-		str = strings.TrimSpace(str)
-		prefix, err := netip.ParsePrefix(str)
-		if err != nil {
-			addr, err2 := netip.ParseAddr(str)
-			if err2 != nil {
-				return InterfaceConfig{}, fmt.Errorf("address %q is not a valid IP address or CIDR prefix: %w", str, err)
-			}
-			if addr.Is4() {
-				prefix = netip.PrefixFrom(addr, 32)
-			} else {
-				prefix = netip.PrefixFrom(addr, 128)
-			}
-		}
-		addresses = append(addresses, prefix)
+	addresses, err := parseInterfaceAddresses(iface)
+	if err != nil {
+		return InterfaceConfig{}, err
 	}
 	device.Addresses = addresses
 
-	key = iface.Key("PrivateKey")
+	key := iface.Key("PrivateKey")
 	if key == nil {
 		return InterfaceConfig{}, errors.New("PrivateKey should not be empty")
 	}
@@ -144,7 +213,7 @@ func ParseInterface(cfg *ini.File) (InterfaceConfig, error) {
 		addrs := sectionKey.StringsWithShadows(",")
 		device.DNS = make([]netip.Addr, len(addrs))
 		for i, addr := range addrs {
-			ip, err := netip.ParseAddr(addr)
+			ip, err := netip.ParseAddr(strings.TrimSpace(addr))
 			if err != nil {
 				return InterfaceConfig{}, err
 			}
@@ -166,6 +235,10 @@ func ParseInterface(cfg *ini.File) (InterfaceConfig, error) {
 			return InterfaceConfig{}, err
 		}
 		device.FwMark = uint32(value)
+	}
+
+	if err := parseInterfaceObfuscation(iface, &device); err != nil {
+		return InterfaceConfig{}, err
 	}
 
 	return device, nil

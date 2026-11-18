@@ -23,12 +23,12 @@ var defaultConfigPaths = []string{
 
 // Global variables to hold flag values
 var (
-	configFile string
-	silent     bool
-	socksAddr  string
-	httpAddr   string
-	username   string
-	password   string
+	configFiles []string
+	silent      bool
+	socksAddr   string
+	httpAddr    string
+	username    string
+	password    string
 )
 
 // check if default config file paths exist
@@ -52,17 +52,21 @@ var rootCmd = &cobra.Command{
 	Short:   "A user-space WireGuard client that exposes a SOCKS and HTTP proxy.",
 	Version: version.String(),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if configFile == "" {
+		if len(configFiles) == 0 {
 			if path, configExist := configFilePath(); configExist {
-				configFile = path
+				configFiles = []string{path}
 			} else {
 				return fmt.Errorf("path to a configuration file is required")
 			}
 		}
 
-		conf, err := wiresocks.ParseConfig(configFile)
-		if err != nil {
-			return fmt.Errorf("failed to parse config file: %v", err)
+		confs := make([]*wiresocks.Configuration, 0, len(configFiles))
+		for _, path := range configFiles {
+			conf, err := wiresocks.ParseConfig(path)
+			if err != nil {
+				return fmt.Errorf("failed to parse config file %q: %v", path, err)
+			}
+			confs = append(confs, conf)
 		}
 
 		proxyOpts := &wiresocks.ProxyConfig{
@@ -98,7 +102,7 @@ var rootCmd = &cobra.Command{
 
 		ws, err := wiresocks.NewWireSocks(
 			wiresocks.WithContext(ctx),
-			wiresocks.WithWireguardConfig(conf),
+			wiresocks.WithWireguardChain(confs...),
 			wiresocks.WithProxyConfig(proxyOpts),
 			wiresocks.WithLogLevel(logLevel),
 		)
@@ -112,19 +116,15 @@ var rootCmd = &cobra.Command{
 			cancel()
 		}()
 
-		go func() {
-			if err := ws.Run(); err != nil {
-				fatal(fmt.Errorf("wiresocks failed to run: %v", err))
-			}
-		}()
-
-		<-ctx.Done()
+		if err := ws.Run(); err != nil {
+			fatal(fmt.Errorf("wiresocks failed to run: %v", err))
+		}
 		return nil
 	},
 }
 
 func init() {
-	rootCmd.PersistentFlags().StringVarP(&configFile, "config", "c", "", "Path to the configuration file.")
+	rootCmd.PersistentFlags().StringSliceVarP(&configFiles, "config", "c", nil, "Path to the configuration file(s). Specify multiple times to chain tunnels.")
 	rootCmd.PersistentFlags().BoolVar(&silent, "silent", false, "Enable silent mode.")
 	rootCmd.PersistentFlags().StringVar(&socksAddr, "socks-addr", "", "SOCKS5 proxy bind address.")
 	rootCmd.PersistentFlags().StringVar(&httpAddr, "http-addr", "", "HTTP proxy bind address.")
