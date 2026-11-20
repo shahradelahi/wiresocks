@@ -349,7 +349,7 @@ func TestCreateIPCRequestChaining(t *testing.T) {
 		t.Fatalf("expected keepalive 25, got:\n%s", ipc1)
 	}
 
-	// Hop 2 (upstream != nil): omits junk packets unless explicitly configured
+	// Hop 2 (upstream != nil): uses temporary keepalive 25 for startup handshake, omits jc unless explicitly configured
 	upstream := &VirtualTun{}
 	ipc2, err := createIPCRequest(context.Background(), conf, upstream)
 	if err != nil {
@@ -357,6 +357,9 @@ func TestCreateIPCRequestChaining(t *testing.T) {
 	}
 	if strings.Contains(ipc2, "jc=") {
 		t.Fatalf("expected jc to be omitted on chained hop without explicit AWG config, got:\n%s", ipc2)
+	}
+	if !strings.Contains(ipc2, "persistent_keepalive_interval=25\n") {
+		t.Fatalf("expected startup keepalive 25, got:\n%s", ipc2)
 	}
 }
 

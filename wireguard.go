@@ -132,7 +132,7 @@ func createIPCRequest(ctx context.Context, conf *Configuration, upstream *Virtua
 		fmt.Fprintf(&request, "public_key=%s\n", peer.PublicKey)
 		keepAlive := peer.KeepAlive
 		if keepAlive <= 0 {
-			keepAlive = 10
+			keepAlive = 25
 		}
 		fmt.Fprintf(&request, "persistent_keepalive_interval=%d\n", keepAlive)
 		if peer.PreSharedKey != "" {
@@ -162,6 +162,7 @@ func createIPCRequest(ctx context.Context, conf *Configuration, upstream *Virtua
 func establishWireguard(ctx context.Context, conf *Configuration, tunDev tun.Device, upstream *VirtualTun, logLevel int) (*device.Device, error) {
 	request, err := createIPCRequest(ctx, conf, upstream)
 	if err != nil {
+		_ = tunDev.Close()
 		return nil, fmt.Errorf("failed to create IPC request: %w", err)
 	}
 
@@ -195,6 +196,22 @@ func establishWireguard(ctx context.Context, conf *Configuration, tunDev tun.Dev
 		_ = dev.BindClose()
 		dev.Close()
 		return nil, fmt.Errorf("handshake failed: %w", err)
+	}
+
+	if upstream != nil {
+		var disableKA strings.Builder
+		for _, peer := range conf.Peers {
+			if peer.KeepAlive <= 0 {
+				fmt.Fprintf(&disableKA, "public_key=%s\npersistent_keepalive_interval=0\n", peer.PublicKey)
+			}
+		}
+		if disableKA.Len() > 0 {
+			if err := dev.IpcSet(disableKA.String()); err != nil {
+				_ = dev.BindClose()
+				dev.Close()
+				return nil, fmt.Errorf("failed to reset keepalive: %w", err)
+			}
+		}
 	}
 
 	return dev, nil
